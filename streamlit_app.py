@@ -14,6 +14,8 @@ import time  # 放到文件顶部 import 区
 import importlib.util
 from pathlib import Path
 import streamlit as st
+from streamlit.runtime.scriptrunner import add_script_run_ctx
+from streamlit_autorefresh import st_autorefresh
 
 # ---- 1) 动态加载你原来的 .py（文件名包含中文也没关系）----
 BASE_DIR = Path(__file__).resolve().parent
@@ -80,7 +82,7 @@ def show_log(lines):
     st.code("\n".join(lines), language="text")
 
 # ---- 4) 页面 ----
-st.title("神秘游戏 presented by dian_mi")
+st.title("神秘游戏")
 
 col_btn1, col_btn2, col_btn3, col_btn4, col_btn5 = st.columns([1,1,1,1,2])
 
@@ -132,6 +134,8 @@ with col_btn4:
     label = "停止自动播放" if st.session_state["autoplay"] else "自动播放"
     if st.button(label, use_container_width=True):
         st.session_state["autoplay"] = not st.session_state["autoplay"]
+        if not st.session_state["autoplay"]:
+            st.session_state.pop("autoplay_tick", None)
         st.rerun()
     st.write("手机端建议横屏使用")
 
@@ -143,20 +147,28 @@ if snap is None:
     # 如果还没开始回放，就展示当前引擎快照（用内部方法 _snapshot）
     snap = engine._snapshot()
 
+# ---- 自动播放：用定时刷新实现逐行更新（不要 time.sleep）----
 if st.session_state["autoplay"]:
+    # 每隔 autoplay_ms 自动刷新一次页面
+    st_autorefresh(interval=st.session_state["autoplay_ms"], key="autoplay_tick")
+
     frames = engine.replay_frames
     cur = st.session_state["cursor"]
 
+    # 如果还没生成回放（没点“开始回合”），就先停掉自动播放
     if not frames:
         st.session_state["autoplay"] = False
     else:
+        # 每次刷新推进一行
         if cur < len(frames):
-            time.sleep(st.session_state["autoplay_ms"] / 1000.0)
             frame = frames[cur]
             st.session_state["cursor"] += 1
             st.session_state["revealed_lines"].append(frame["text"])
             st.session_state["current_snap"] = frame["snap"]
-            st.rerun()
+        else:
+            # 到末尾自动停止
+            st.session_state["autoplay"] = False
+
         else:
             st.session_state["autoplay"] = False
 

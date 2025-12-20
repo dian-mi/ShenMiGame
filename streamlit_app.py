@@ -168,7 +168,6 @@ if st.session_state["autoplay"]:
         else:
             # 到末尾自动停止
             st.session_state["autoplay"] = False
-
         else:
             st.session_state["autoplay"] = False
 

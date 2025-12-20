@@ -40,6 +40,10 @@ if "revealed_lines" not in st.session_state:
     st.session_state.revealed_lines = []
 if "current_snap" not in st.session_state:
     st.session_state.current_snap = None
+if "autoplay" not in st.session_state:
+    st.session_state.autoplay = False
+if "autoplay_ms" not in st.session_state:
+    st.session_state.autoplay_ms = 400  # 默认 0.4 秒/行
 
 engine: Engine = st.session_state.engine
 
@@ -114,30 +118,21 @@ with col_btn3:
             st.session_state.current_snap = frame["snap"]
         st.rerun()
 
-with col_btn4:
-    # 自动播放开关
-    label = "停止自动播放" if st.session_state.autoplay else "自动播放"
-    if st.button(label, use_container_width=True):
-        st.session_state.autoplay = not st.session_state.autoplay
-        st.rerun()
-
 with col_btn5:
-    st.session_state.autoplay_ms = st.slider(
+    st.session_state["autoplay_ms"] = st.slider(
         "播放速度（毫秒/行）",
         min_value=100,
         max_value=2000,
-        value=st.session_state.autoplay_ms,
+        value=st.session_state["autoplay_ms"],
         step=50
     )
     st.write("made by dian_mi")
 
-if "autoplay" not in st.session_state:
-    st.session_state.autoplay = False
-if "autoplay_ms" not in st.session_state:
-    st.session_state.autoplay_ms = 400  # 默认 0.4 秒/行
-
-# 右侧：快速操作
 with col_btn4:
+    label = "停止自动播放" if st.session_state["autoplay"] else "自动播放"
+    if st.button(label, use_container_width=True):
+        st.session_state["autoplay"] = not st.session_state["autoplay"]
+        st.rerun()
     st.write("手机端建议横屏使用")
 
 # ---- 5) 主体两栏 ----
@@ -148,24 +143,22 @@ if snap is None:
     # 如果还没开始回放，就展示当前引擎快照（用内部方法 _snapshot）
     snap = engine._snapshot()
 
-if st.session_state.autoplay:
+if st.session_state["autoplay"]:
     frames = engine.replay_frames
-    cur = st.session_state.cursor
+    cur = st.session_state["cursor"]
 
-    # 如果还没生成回放（没点“开始回合”），就先停掉自动播放
     if not frames:
-        st.session_state.autoplay = False
+        st.session_state["autoplay"] = False
     else:
-        # 还有下一行就继续推进；到末尾就自动停止
         if cur < len(frames):
-            time.sleep(st.session_state.autoplay_ms / 1000.0)
+            time.sleep(st.session_state["autoplay_ms"] / 1000.0)
             frame = frames[cur]
-            st.session_state.cursor += 1
-            st.session_state.revealed_lines.append(frame["text"])
-            st.session_state.current_snap = frame["snap"]
+            st.session_state["cursor"] += 1
+            st.session_state["revealed_lines"].append(frame["text"])
+            st.session_state["current_snap"] = frame["snap"]
             st.rerun()
         else:
-            st.session_state.autoplay = False
+            st.session_state["autoplay"] = False
 
 with left:
     show_rank(snap)

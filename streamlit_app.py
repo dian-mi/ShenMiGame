@@ -77,7 +77,7 @@ def show_rank(snap):
 def show_log(lines):
     st.subheader("战报（逐行回放）")
     if not lines:
-        st.info("还没有回放内容。点“开始回合”生成本回合逐行回放，然后点“下一行”。")
+        st.info("点击新开局进行新的开局，点击开始回合跳过此回合，点击下一行进行下一判定，自动播放可以解放双手，滑块调整播放速度")
         return
     st.code("\n".join(lines), language="text")
 
@@ -95,7 +95,7 @@ with col_btn1:
         st.rerun()
 
 with col_btn2:
-    if st.button("开始回合（生成回放）", use_container_width=True):
+    if st.button("开始回合", use_container_width=True):
         engine.tick_alive_turns()
         engine.next_turn()
         st.session_state.cursor = 0
@@ -137,7 +137,7 @@ with col_btn4:
         if not st.session_state["autoplay"]:
             st.session_state.pop("autoplay_tick", None)
         st.rerun()
-    st.write("手机端建议横屏使用")
+    st.write("手机端ui可能会有问题，最好使用电脑端进行游戏")
 
 # ---- 5) 主体两栏 ----
 left, right = st.columns([1.2, 1])

@@ -8,13 +8,22 @@
 规则与技能以用户提供的“游戏规则推演提示词”为准（含：世界规则、补刀、护盾、封印/遗忘/遗策、双生、集火、挡刀等）。
 """
 
-import tkinter.font as tkfont
+try:
+    import tkinter as tk
+    import tkinter.font as tkfont
+    from tkinter import ttk
+    TK_AVAILABLE = True
+except Exception:
+    tk = None
+    tkfont = None
+    ttk = None
+    TK_AVAILABLE = False
+
 import random
 import re
-import tkinter as tk
-from tkinter import ttk
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Any
+
 
 
 # =========================
@@ -1473,365 +1482,365 @@ class Engine:
 # =========================
 # UI
 # =========================
+if TK_AVAILABLE:
+    class UI:
+        def __init__(self, root: tk.Tk):
+            self.root = root
+            self.root.title("26人规则版推演器")
+            self.root.geometry("1100x720")
 
-class UI:
-    def __init__(self, root: tk.Tk):
-        self.root = root
-        self.root.title("26人规则版推演器")
-        self.root.geometry("1100x720")
-
-        self.engine = Engine(seed=None)
-        # 字体：你可以继续调大
-        self.font_rank = tkfont.Font(family="Microsoft YaHei UI", size=16, weight="normal")
-        self.font_log  = tkfont.Font(family="Microsoft YaHei UI", size=14, weight="normal")
-        # 日志高亮用：同字号粗体
-        self.font_log_bold = tkfont.Font(family="Microsoft YaHei UI", size=14, weight="bold")
-        # 日志：击败者名字标红用tag
-        self._cid_pat = re.compile(r"\((\d{1,2})\)")
-        self.revealed_victims: List[Optional[int]] = []  # 每行对应的“被击败者cid”（无则None）
-
-
-
-        self.play_cursor = 0
-        self.playing = False
-        self.speed_var = tk.DoubleVar(value=0.25)
-        self.revealed_lines: List[str] = []
-        self.revealed_hls: List[List[int]] = []   # 每一行对应的高亮cid列表
-        self.current_snap = None
-        # 直播高亮相关（即使暂时不用，也要初始化，避免点击崩）
-        self.current_highlights = set()
-        self._flash_job = None
+            self.engine = Engine(seed=None)
+            # 字体：你可以继续调大
+            self.font_rank = tkfont.Font(family="Microsoft YaHei UI", size=16, weight="normal")
+            self.font_log  = tkfont.Font(family="Microsoft YaHei UI", size=14, weight="normal")
+            # 日志高亮用：同字号粗体
+            self.font_log_bold = tkfont.Font(family="Microsoft YaHei UI", size=14, weight="bold")
+            # 日志：击败者名字标红用tag
+            self._cid_pat = re.compile(r"\((\d{1,2})\)")
+            self.revealed_victims: List[Optional[int]] = []  # 每行对应的“被击败者cid”（无则None）
 
 
 
-        self._build()
-        self.refresh()
-
-    def _build(self):
-        self.main = ttk.Frame(self.root, padding=8)
-        self.main.pack(fill=tk.BOTH, expand=True)
-
-        self.main.columnconfigure(0, weight=3)
-        self.main.columnconfigure(1, weight=2)
-        self.main.rowconfigure(0, weight=1)
-        self.main.rowconfigure(1, weight=0)
-
-        # 左：排名（单栏，大）
-        self.left = ttk.Frame(self.main)
-        self.left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        self.left.columnconfigure(0, weight=1)
-        self.left.rowconfigure(0, weight=1)
-
-        # 单栏容器
-        self.rank_frame = ttk.Frame(self.left)
-        self.rank_frame.grid(row=0, column=0, sticky="nsew")
-
-        # 右：日志
-        self.right = ttk.Frame(self.main)
-        self.right.grid(row=0, column=1, sticky="nsew")
-        self.right.rowconfigure(0, weight=1)
-        self.right.columnconfigure(0, weight=1)
-
-        self.log_text = tk.Text(self.right, wrap="word", font=self.font_log)
-        self.log_text.grid(row=0, column=0, sticky="nsew")
-        scroll = ttk.Scrollbar(self.right, command=self.log_text.yview)
-        scroll.grid(row=0, column=1, sticky="ns")
-        self.log_text.configure(yscrollcommand=scroll.set)
-        self.log_text.configure(state="disabled")
-
-        # 底部按钮
-        self.bottom = ttk.Frame(self.main)
-        self.bottom.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        self.bottom.columnconfigure(0, weight=1)
-
-        self.btn_new = ttk.Button(self.bottom, text="新开局", command=self.on_new)
-        self.btn_new.grid(row=0, column=0, sticky="w")
-        ttk.Label(self.bottom, text="made by dian_mi（好吧其实都是ChatGPT写的）").grid(row=0, column=0, padx=(110, 0), sticky="w")
-
-
-        self.btn_turn = ttk.Button(self.bottom, text="开始回合(生成逐行回放)", command=self.on_build_turn)
-        self.btn_turn.grid(row=0, column=1, padx=8)
-
-        self.btn_step = ttk.Button(self.bottom, text="下一行", command=self.on_step_line)
-        self.btn_step.grid(row=0, column=2, padx=8)
-
-        self.btn_auto = ttk.Button(self.bottom, text="自动播放", command=self.on_auto_play)
-        self.btn_auto.grid(row=0, column=3, padx=8)
-
-        self.btn_pause = ttk.Button(self.bottom, text="暂停", command=self.on_pause)
-        self.btn_pause.grid(row=0, column=4, padx=8)
-        # 速度控制：0.1s ~ 2.0s
-        ttk.Label(self.bottom, text="播放速度").grid(row=0, column=5, padx=(20, 6))
-
-        self.speed_scale = ttk.Scale(
-            self.bottom,
-            from_=0.1,
-            to=2.0,
-            orient="horizontal",
-            variable=self.speed_var,
-            command=lambda _v: self._update_speed_label()
-        )
-        self.speed_scale.grid(row=0, column=6, padx=6, sticky="ew")
-
-        self.speed_label = ttk.Label(self.bottom, text="")
-        self.speed_label.grid(row=0, column=7, padx=(6, 0))
-
-        self.bottom.columnconfigure(6, weight=1)
-        self._update_speed_label()
-
-
-    def on_new(self):
-        self.engine.new_game()
-        self.play_cursor = 0
-        self.playing = False
-        self.revealed_lines = []
-        self.revealed_hls = []
-        self.revealed_victims = []
-        self.current_snap = None
-        self.refresh()
-
-    def on_build_turn(self):
-        # 先结算一整回合，但不直接展示整回合结果
-        self.engine.tick_alive_turns()
-        self.engine.next_turn()
-
-        self.play_cursor = 0
-        self.playing = False
-        self.revealed_lines = []
-        self.revealed_hls = []
-        self.revealed_victims = []
-        self.current_snap = None
-
-        # 默认先显示第一行（通常是“第N回合开始”）
-        if self.engine.replay_frames:
-            self.on_step_line()
-        else:
-            self.refresh()
-
-    def on_step_line(self):
-        frames = self.engine.replay_frames
-        if self.play_cursor >= len(frames):
+            self.play_cursor = 0
             self.playing = False
-            return
+            self.speed_var = tk.DoubleVar(value=0.25)
+            self.revealed_lines: List[str] = []
+            self.revealed_hls: List[List[int]] = []   # 每一行对应的高亮cid列表
+            self.current_snap = None
+            # 直播高亮相关（即使暂时不用，也要初始化，避免点击崩）
+            self.current_highlights = set()
+            self._flash_job = None
 
-        frame = frames[self.play_cursor]
-        self.play_cursor += 1
 
-        self.revealed_lines.append(frame["text"])
-        self.revealed_hls.append(frame.get("highlights", []))
-        self.revealed_victims.append(self._parse_victim_cid(frame["text"]))
-        self.current_snap = frame["snap"]
-        self.current_highlights = set(frame.get("highlights", []))
 
-        self.refresh_replay_view()
+            self._build()
+            self.refresh()
 
-        if self.playing:
-            delay_ms = int(max(0.1, min(2.0, float(self.speed_var.get()))) * 1000)
-            self.root.after(delay_ms, self.on_step_line)
+        def _build(self):
+            self.main = ttk.Frame(self.root, padding=8)
+            self.main.pack(fill=tk.BOTH, expand=True)
 
-    def on_auto_play(self):
-        if not self.engine.replay_frames:
-            return
-        self.playing = True
-        self.on_step_line()
+            self.main.columnconfigure(0, weight=3)
+            self.main.columnconfigure(1, weight=2)
+            self.main.rowconfigure(0, weight=1)
+            self.main.rowconfigure(1, weight=0)
 
-    def on_pause(self):
-        self.playing = False
+            # 左：排名（单栏，大）
+            self.left = ttk.Frame(self.main)
+            self.left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+            self.left.columnconfigure(0, weight=1)
+            self.left.rowconfigure(0, weight=1)
 
-    def _parse_victim_cid(self, line: str) -> Optional[int]:
-        # 死亡行："【死亡】名字(cid)..."
-        if "【死亡】" in line:
-            m = self._cid_pat.search(line)
-            return int(m.group(1)) if m else None
+            # 单栏容器
+            self.rank_frame = ttk.Frame(self.left)
+            self.rank_frame.grid(row=0, column=0, sticky="nsew")
 
-        # 击杀行："【击杀】凶手(...) → 受害者(cid)..."
-        if "【击杀】" in line:
-            ids = [int(m.group(1)) for m in self._cid_pat.finditer(line)]
-            if len(ids) >= 2:
-                return ids[1]  # 第二个(cid)是受害者
+            # 右：日志
+            self.right = ttk.Frame(self.main)
+            self.right.grid(row=0, column=1, sticky="nsew")
+            self.right.rowconfigure(0, weight=1)
+            self.right.columnconfigure(0, weight=1)
+
+            self.log_text = tk.Text(self.right, wrap="word", font=self.font_log)
+            self.log_text.grid(row=0, column=0, sticky="nsew")
+            scroll = ttk.Scrollbar(self.right, command=self.log_text.yview)
+            scroll.grid(row=0, column=1, sticky="ns")
+            self.log_text.configure(yscrollcommand=scroll.set)
+            self.log_text.configure(state="disabled")
+
+            # 底部按钮
+            self.bottom = ttk.Frame(self.main)
+            self.bottom.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+            self.bottom.columnconfigure(0, weight=1)
+
+            self.btn_new = ttk.Button(self.bottom, text="新开局", command=self.on_new)
+            self.btn_new.grid(row=0, column=0, sticky="w")
+            ttk.Label(self.bottom, text="made by dian_mi（好吧其实都是ChatGPT写的）").grid(row=0, column=0, padx=(110, 0), sticky="w")
+
+
+            self.btn_turn = ttk.Button(self.bottom, text="开始回合(生成逐行回放)", command=self.on_build_turn)
+            self.btn_turn.grid(row=0, column=1, padx=8)
+
+            self.btn_step = ttk.Button(self.bottom, text="下一行", command=self.on_step_line)
+            self.btn_step.grid(row=0, column=2, padx=8)
+
+            self.btn_auto = ttk.Button(self.bottom, text="自动播放", command=self.on_auto_play)
+            self.btn_auto.grid(row=0, column=3, padx=8)
+
+            self.btn_pause = ttk.Button(self.bottom, text="暂停", command=self.on_pause)
+            self.btn_pause.grid(row=0, column=4, padx=8)
+            # 速度控制：0.1s ~ 2.0s
+            ttk.Label(self.bottom, text="播放速度").grid(row=0, column=5, padx=(20, 6))
+
+            self.speed_scale = ttk.Scale(
+                self.bottom,
+                from_=0.1,
+                to=2.0,
+                orient="horizontal",
+                variable=self.speed_var,
+                command=lambda _v: self._update_speed_label()
+            )
+            self.speed_scale.grid(row=0, column=6, padx=6, sticky="ew")
+
+            self.speed_label = ttk.Label(self.bottom, text="")
+            self.speed_label.grid(row=0, column=7, padx=(6, 0))
+
+            self.bottom.columnconfigure(6, weight=1)
+            self._update_speed_label()
+
+
+        def on_new(self):
+            self.engine.new_game()
+            self.play_cursor = 0
+            self.playing = False
+            self.revealed_lines = []
+            self.revealed_hls = []
+            self.revealed_victims = []
+            self.current_snap = None
+            self.refresh()
+
+        def on_build_turn(self):
+            # 先结算一整回合，但不直接展示整回合结果
+            self.engine.tick_alive_turns()
+            self.engine.next_turn()
+
+            self.play_cursor = 0
+            self.playing = False
+            self.revealed_lines = []
+            self.revealed_hls = []
+            self.revealed_victims = []
+            self.current_snap = None
+
+            # 默认先显示第一行（通常是“第N回合开始”）
+            if self.engine.replay_frames:
+                self.on_step_line()
+            else:
+                self.refresh()
+
+        def on_step_line(self):
+            frames = self.engine.replay_frames
+            if self.play_cursor >= len(frames):
+                self.playing = False
+                return
+
+            frame = frames[self.play_cursor]
+            self.play_cursor += 1
+
+            self.revealed_lines.append(frame["text"])
+            self.revealed_hls.append(frame.get("highlights", []))
+            self.revealed_victims.append(self._parse_victim_cid(frame["text"]))
+            self.current_snap = frame["snap"]
+            self.current_highlights = set(frame.get("highlights", []))
+
+            self.refresh_replay_view()
+
+            if self.playing:
+                delay_ms = int(max(0.1, min(2.0, float(self.speed_var.get()))) * 1000)
+                self.root.after(delay_ms, self.on_step_line)
+
+        def on_auto_play(self):
+            if not self.engine.replay_frames:
+                return
+            self.playing = True
+            self.on_step_line()
+
+        def on_pause(self):
+            self.playing = False
+
+        def _parse_victim_cid(self, line: str) -> Optional[int]:
+            # 死亡行："【死亡】名字(cid)..."
+            if "【死亡】" in line:
+                m = self._cid_pat.search(line)
+                return int(m.group(1)) if m else None
+
+            # 击杀行："【击杀】凶手(...) → 受害者(cid)..."
+            if "【击杀】" in line:
+                ids = [int(m.group(1)) for m in self._cid_pat.finditer(line)]
+                if len(ids) >= 2:
+                    return ids[1]  # 第二个(cid)是受害者
+                return None
+
             return None
-
-        return None
-        
-    def _update_speed_label(self):
-        try:
-            v = float(self.speed_var.get())
-        except Exception:
-            v = 0.25
-        self.speed_label.config(text=f"{v:.2f}s/行")
-
-    def refresh_replay_view(self):
-        snap = self.current_snap
-        if not snap:
-            self.refresh()
-            return
-
-        rank = snap["rank"]
-        status_map = snap["status"]
-
-        # 左侧：单栏 + 高亮
-        for w in self.rank_frame.winfo_children():
-            w.destroy()
-
-        hl = self.current_highlights
-
-        for i, cid in enumerate(rank, start=1):
-            info = status_map[cid]
-            st = info["brief"]
-            text = f"{i:>2}. {info['name']}({cid})"
-            if st:
-                text += f"   [{st}]"
-
-            bg = "#FFF2A8" if cid in hl else self.root.cget("bg")
-            lbl = tk.Label(
-                self.rank_frame,
-                text=text,
-                anchor="w",
-                font=self.font_rank,
-                bg=bg
-            )
-            lbl.pack(fill="x", pady=2)
-
-        # 右侧日志
-        self.render_log_with_current_highlight(self.revealed_lines, self.revealed_hls)
-
-
-        # 👇 关键：这里就是你之前“找不到”的那一行
-        if self._flash_job is not None:
+            
+        def _update_speed_label(self):
             try:
-                self.root.after_cancel(self._flash_job)
+                v = float(self.speed_var.get())
             except Exception:
-                pass
+                v = 0.25
+            self.speed_label.config(text=f"{v:.2f}s/行")
 
-        self._flash_job = self.root.after(150, self._clear_flash)
+        def refresh_replay_view(self):
+            snap = self.current_snap
+            if not snap:
+                self.refresh()
+                return
 
-    def _clear_flash(self):
-        self._flash_job = None
-        if not self.current_snap:
-            return
-        self.current_highlights = set()
-        # 只重绘，不再触发闪烁
-        self.refresh_replay_view_no_flash()
+            rank = snap["rank"]
+            status_map = snap["status"]
 
-    def refresh_replay_view_no_flash(self):
-        snap = self.current_snap
-        if not snap:
-            self.refresh()
-            return
+            # 左侧：单栏 + 高亮
+            for w in self.rank_frame.winfo_children():
+                w.destroy()
 
-        rank = snap["rank"]
-        status_map = snap["status"]
+            hl = self.current_highlights
 
-        for w in self.rank_frame.winfo_children():
-            w.destroy()
+            for i, cid in enumerate(rank, start=1):
+                info = status_map[cid]
+                st = info["brief"]
+                text = f"{i:>2}. {info['name']}({cid})"
+                if st:
+                    text += f"   [{st}]"
 
-        for i, cid in enumerate(rank, start=1):
-            info = status_map[cid]
-            st = info["brief"]
-            text = f"{i:>2}. {info['name']}({cid})"
-            if st:
-                text += f"   [{st}]"
+                bg = "#FFF2A8" if cid in hl else self.root.cget("bg")
+                lbl = tk.Label(
+                    self.rank_frame,
+                    text=text,
+                    anchor="w",
+                    font=self.font_rank,
+                    bg=bg
+                )
+                lbl.pack(fill="x", pady=2)
 
-            lbl = tk.Label(
-                self.rank_frame,
-                text=text,
-                anchor="w",
-                font=self.font_rank
-            )
-            lbl.pack(fill="x", pady=2)
+            # 右侧日志
+            self.render_log_with_current_highlight(self.revealed_lines, self.revealed_hls)
 
-        self.render_log_with_current_highlight(self.revealed_lines, self.revealed_hls)
 
-        
-    def render_log_with_current_highlight(self, lines: List[str], hls: List[List[int]]):
-        """
-        - 所有行：若该行是【死亡】或【击杀】，则“被击败者名字(cid)”标红
-        - 当前行（最后一行）：该行涉及的角色名(cid)加粗（直播感）
-        """
-        self.log_text.configure(state="normal")
-        self.log_text.delete("1.0", tk.END)
+            # 👇 关键：这里就是你之前“找不到”的那一行
+            if self._flash_job is not None:
+                try:
+                    self.root.after_cancel(self._flash_job)
+                except Exception:
+                    pass
 
-        # tag 配置（重复配置无害）
-        self.log_text.tag_configure("hl_current", font=self.font_log_bold)
-        self.log_text.tag_configure("victim_red", foreground="red")
+            self._flash_job = self.root.after(150, self._clear_flash)
 
-        last_i = len(lines) - 1
+        def _clear_flash(self):
+            self._flash_job = None
+            if not self.current_snap:
+                return
+            self.current_highlights = set()
+            # 只重绘，不再触发闪烁
+            self.refresh_replay_view_no_flash()
 
-        for i, line in enumerate(lines):
-            start_idx = self.log_text.index(tk.INSERT)
-            self.log_text.insert(tk.END, line + "\n")
-            end_idx = self.log_text.index(tk.INSERT)
+        def refresh_replay_view_no_flash(self):
+            snap = self.current_snap
+            if not snap:
+                self.refresh()
+                return
 
-            # 1) 红名：被击败者
-            victim_cid = None
-            if i < len(self.revealed_victims):
-                victim_cid = self.revealed_victims[i]
-            if victim_cid is not None and victim_cid in self.engine.roles:
-                token_v = f"{self.engine.roles[victim_cid].name}({victim_cid})"
-                search_from = start_idx
-                while True:
-                    pos = self.log_text.search(token_v, search_from, stopindex=end_idx)
-                    if not pos:
-                        break
-                    pos_end = f"{pos}+{len(token_v)}c"
-                    self.log_text.tag_add("victim_red", pos, pos_end)
-                    search_from = pos_end
+            rank = snap["rank"]
+            status_map = snap["status"]
 
-            # 2) 当前行加粗：涉及角色
-            if i == last_i and i < len(hls):
-                for cid in hls[i]:
-                    if cid not in self.engine.roles:
-                        continue
-                    token = f"{self.engine.roles[cid].name}({cid})"
+            for w in self.rank_frame.winfo_children():
+                w.destroy()
+
+            for i, cid in enumerate(rank, start=1):
+                info = status_map[cid]
+                st = info["brief"]
+                text = f"{i:>2}. {info['name']}({cid})"
+                if st:
+                    text += f"   [{st}]"
+
+                lbl = tk.Label(
+                    self.rank_frame,
+                    text=text,
+                    anchor="w",
+                    font=self.font_rank
+                )
+                lbl.pack(fill="x", pady=2)
+
+            self.render_log_with_current_highlight(self.revealed_lines, self.revealed_hls)
+
+            
+        def render_log_with_current_highlight(self, lines: List[str], hls: List[List[int]]):
+            """
+            - 所有行：若该行是【死亡】或【击杀】，则“被击败者名字(cid)”标红
+            - 当前行（最后一行）：该行涉及的角色名(cid)加粗（直播感）
+            """
+            self.log_text.configure(state="normal")
+            self.log_text.delete("1.0", tk.END)
+
+            # tag 配置（重复配置无害）
+            self.log_text.tag_configure("hl_current", font=self.font_log_bold)
+            self.log_text.tag_configure("victim_red", foreground="red")
+
+            last_i = len(lines) - 1
+
+            for i, line in enumerate(lines):
+                start_idx = self.log_text.index(tk.INSERT)
+                self.log_text.insert(tk.END, line + "\n")
+                end_idx = self.log_text.index(tk.INSERT)
+
+                # 1) 红名：被击败者
+                victim_cid = None
+                if i < len(self.revealed_victims):
+                    victim_cid = self.revealed_victims[i]
+                if victim_cid is not None and victim_cid in self.engine.roles:
+                    token_v = f"{self.engine.roles[victim_cid].name}({victim_cid})"
                     search_from = start_idx
                     while True:
-                        pos = self.log_text.search(token, search_from, stopindex=end_idx)
+                        pos = self.log_text.search(token_v, search_from, stopindex=end_idx)
                         if not pos:
                             break
-                        pos_end = f"{pos}+{len(token)}c"
-                        self.log_text.tag_add("hl_current", pos, pos_end)
+                        pos_end = f"{pos}+{len(token_v)}c"
+                        self.log_text.tag_add("victim_red", pos, pos_end)
                         search_from = pos_end
 
-        self.log_text.configure(state="disabled")
-        self.log_text.see(tk.END)
+                # 2) 当前行加粗：涉及角色
+                if i == last_i and i < len(hls):
+                    for cid in hls[i]:
+                        if cid not in self.engine.roles:
+                            continue
+                        token = f"{self.engine.roles[cid].name}({cid})"
+                        search_from = start_idx
+                        while True:
+                            pos = self.log_text.search(token, search_from, stopindex=end_idx)
+                            if not pos:
+                                break
+                            pos_end = f"{pos}+{len(token)}c"
+                            self.log_text.tag_add("hl_current", pos, pos_end)
+                            search_from = pos_end
 
-    def on_next(self):
-        # 回合推进前：更新连续存活/死亡回合计数（给梅雨神等使用）
-        self.engine.tick_alive_turns()
-        self.engine.next_turn()
-        self.refresh()
+            self.log_text.configure(state="disabled")
+            self.log_text.see(tk.END)
 
-    def refresh(self):
-        # 左侧排名（单栏）
-        for w in self.rank_frame.winfo_children():
-            w.destroy()
+        def on_next(self):
+            # 回合推进前：更新连续存活/死亡回合计数（给梅雨神等使用）
+            self.engine.tick_alive_turns()
+            self.engine.next_turn()
+            self.refresh()
 
-        alive = self.engine.alive_ids()
-        for i, cid in enumerate(alive, start=1):
-            r = self.engine.roles[cid]
-            st = r.status.brief()
-            text = f"{i:>2}. {r.name}({cid})"
-            if st:
-                text += f"   [{st}]"
+        def refresh(self):
+            # 左侧排名（单栏）
+            for w in self.rank_frame.winfo_children():
+                w.destroy()
 
-            lbl = tk.Label(self.rank_frame, text=text, anchor="w", font=self.font_rank)
-            lbl.pack(fill="x", pady=2)
+            alive = self.engine.alive_ids()
+            for i, cid in enumerate(alive, start=1):
+                r = self.engine.roles[cid]
+                st = r.status.brief()
+                text = f"{i:>2}. {r.name}({cid})"
+                if st:
+                    text += f"   [{st}]"
 
-        # 右侧日志（全量显示）
-        self.log_text.configure(state="normal")
-        self.log_text.delete("1.0", tk.END)
-        self.log_text.insert(tk.END, "\n".join(self.engine.log))
-        self.log_text.configure(state="disabled")
-        self.log_text.see(tk.END)
+                lbl = tk.Label(self.rank_frame, text=text, anchor="w", font=self.font_rank)
+                lbl.pack(fill="x", pady=2)
 
-def main():
-    root = tk.Tk()
-    try:
-        ttk.Style().theme_use("clam")
-    except Exception:
-        pass
-    UI(root)
-    root.mainloop()
+            # 右侧日志（全量显示）
+            self.log_text.configure(state="normal")
+            self.log_text.delete("1.0", tk.END)
+            self.log_text.insert(tk.END, "\n".join(self.engine.log))
+            self.log_text.configure(state="disabled")
+            self.log_text.see(tk.END)
 
-if __name__ == "__main__":
-    main()
+    def main():
+        if not TK_AVAILABLE:
+            raise RuntimeError("当前环境不支持 Tkinter（缺少 _tkinter）。请在本地电脑运行桌面版，或使用 Streamlit 网页版。")
+
+        root = tk.Tk()
+        try:
+            ttk.Style().theme_use("clam")
+        except Exception:
+            pass
+        UI(root)
+        root.mainloop()

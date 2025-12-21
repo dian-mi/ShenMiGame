@@ -77,6 +77,11 @@ def _status_color(part: str) -> str:
     if not p:
         return "#64748b"
 
+    # 🔴 死亡：最高优先级，强制红色
+    # （不管后面还有没有别的状态）
+    if "死亡" in p:
+        return COLOR_NEG
+
     # 特殊前缀：单独颜色
     if p.startswith("雷霆"):
         return COLOR_THUNDER
@@ -89,12 +94,13 @@ def _status_color(part: str) -> str:
     if p.startswith(POS_KEYWORDS):
         return COLOR_POS
 
-    # 负面/限制（本体把这些都归为负面色）
+    # 负面 / 限制
     if p.startswith(NEG_KEYWORDS):
         return COLOR_NEG
 
-    # 未知状态：用中性灰
+    # 未知状态：中性灰
     return "#64748b"
+
 
 
 def _render_status_badges(brief: str) -> str:
@@ -153,7 +159,7 @@ def show_log(lines):
 
 
 # ---- 5) 页面 ----
-st.title("神秘游戏 presented by dian_mi")
+st.title("神秘游戏（东滩乱斗）")
 
 col_btn1, col_btn2, col_btn3, col_btn4, col_btn5 = st.columns([1, 1, 1, 1, 2])
 
@@ -221,7 +227,7 @@ with col_btn5:
         value=st.session_state["autoplay_ms"],
         step=50,
     )
-    st.write("made by dian_mi")
+    st.write("made by dian_mi（好吧其实是GPT大人神力）")
 
 # ---- 6) 主体两栏 ----
 left, right = st.columns([1.2, 1])

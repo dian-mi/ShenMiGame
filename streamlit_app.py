@@ -217,7 +217,7 @@ with col_btn4:
         if not st.session_state["autoplay"]:
             st.session_state.pop("autoplay_tick", None)
         st.rerun()
-    st.caption("手机端建议横屏使用")
+    st.caption("顺便帮我测试一下bug（")
 
 with col_btn5:
     st.session_state["autoplay_ms"] = st.slider(

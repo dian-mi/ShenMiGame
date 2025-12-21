@@ -62,25 +62,39 @@ ROW_HL_BG = "#FFF2A8"  # 本体 UI 使用的高亮底色
 
 # ---- 4) 状态颜色（按“神秘游戏”状态文本来匹配）----
 # 说明：本体 rank 列表里状态来自 Status.brief()，形如：护盾2；封印1；遗忘2；集火；永久失效；黄昏3；留痕(目标随机)；厄运(翻倍)；禁得盾；孤傲
-# 这里按“状态语义”上色：护盾=正面（金色），其余大多为负面/限制（红），特殊标记用不同色调，方便区分。
-COLOR_POS = "#D4AF37"     # 护盾等正面
-COLOR_NEG = "#E53935"     # 常见负面/限制
-COLOR_MARK = "#8E44AD"    # 标记类（黄昏/留痕等）
-COLOR_SPECIAL = "#0B3D91" # 其他特殊（如“孤傲”）
+# 颜色与 Tkinter 本体保持一致
+COLOR_THUNDER = "#0B3D91"  # 深蓝：雷霆
+COLOR_FROST   = "#7EC8FF"  # 浅蓝：霜冻
+COLOR_POS     = "#D4AF37"  # 正面（护盾/祝福）
+COLOR_NEG     = "#E53935"  # 负面/限制
+COLOR_PURPLE  = "#8E44AD"  # 紫：腐化
 
+POS_KEYWORDS = ("护盾", "祝福")
+NEG_KEYWORDS = ("雷霆", "霜冻", "封印", "遗忘", "遗策", "黄昏", "留痕", "厄运", "禁盾", "禁得盾", "集火", "孤傲")
 
 def _status_color(part: str) -> str:
     p = part.strip()
     if not p:
         return "#64748b"
-    if p.startswith("护盾") or p.startswith("祝福"):
+
+    # 特殊前缀：单独颜色
+    if p.startswith("雷霆"):
+        return COLOR_THUNDER
+    if p.startswith("霜冻"):
+        return COLOR_FROST
+    if p.startswith("腐化"):
+        return COLOR_PURPLE
+
+    # 正面
+    if p.startswith(POS_KEYWORDS):
         return COLOR_POS
-    if p.startswith("黄昏") or p.startswith("留痕"):
-        return COLOR_MARK
-    if p.startswith("孤傲"):
-        return COLOR_SPECIAL
-    # 其他（封印/遗忘/集火/永久失效/厄运/禁得盾等）
-    return COLOR_NEG
+
+    # 负面/限制（本体把这些都归为负面色）
+    if p.startswith(NEG_KEYWORDS):
+        return COLOR_NEG
+
+    # 未知状态：用中性灰
+    return "#64748b"
 
 
 def _render_status_badges(brief: str) -> str:

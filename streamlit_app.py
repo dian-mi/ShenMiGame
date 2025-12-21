@@ -204,7 +204,7 @@ def show_log(lines):
 
 
 # ---- 5) 页面 ----
-st.title("神秘游戏 presented by dian_mi")
+st.title("神秘游戏（东滩乱斗）")
 
 col_btn1, col_btn2, col_btn3, col_btn4, col_btn5 = st.columns([1, 1, 1, 1, 2])
 
@@ -262,7 +262,7 @@ with col_btn4:
         if not st.session_state["autoplay"]:
             st.session_state.pop("autoplay_tick", None)
         st.rerun()
-    st.caption("手机端建议横屏使用")
+    st.caption("关注电迷谢谢喵")
 
 with col_btn5:
     st.session_state["autoplay_ms"] = st.slider(
@@ -272,7 +272,7 @@ with col_btn5:
         value=st.session_state["autoplay_ms"],
         step=50,
     )
-    st.write("made by dian_mi")
+    st.write("顺便帮我测试一下bug（")
 
 # ---- 6) 主体两栏 ----
 left, right = st.columns([1.2, 1])

@@ -54,11 +54,8 @@ if "show_announcement" not in st.session_state:
     st.session_state.show_announcement = False
 if "announcement_seen" not in st.session_state:
     st.session_state.announcement_seen = False
-
-# 首次进入：自动展开公告一次
-if not st.session_state.announcement_seen:
-    st.session_state.show_announcement = True
-    st.session_state.announcement_seen = True
+if "show_announcement" not in st.session_state:
+    st.session_state.show_announcement = False
 
 # 自动播放相关状态（必须先初始化，按钮里会读）
 if "autoplay" not in st.session_state:

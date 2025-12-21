@@ -328,21 +328,24 @@ st.divider()
 
 col_anno_btn, col_anno_space = st.columns([1, 5])
 with col_anno_btn:
-    if st.button("📢 公告 / Announcement"):
+    if st.button("公告"):
         st.session_state.show_announcement = not st.session_state.show_announcement
 
 if st.session_state.show_announcement:
     st.markdown(
         """
-公告
+**公告**
 
-此为网页版，规则与原版完全一致，手机端建议横屏使用
-但是可能会出现一些莫名其妙的bug
-欢迎反馈
+-此为网页版，规则与原版完全一致，手机端建议横屏使用
+-但是可能会出现一些莫名其妙的bug
+-欢迎反馈
+-如果你也想将自己加入游戏
+-或者觉得自己角色太弱势了（
+-可以跟我讲一下
 
-如果你也想将自己加入游戏
-或者觉得自己角色太弱势了（
-可以跟我讲一下
+
+
+
 
 另外贴一下目前的胜率表：
 名次  角色(编号)                胜场

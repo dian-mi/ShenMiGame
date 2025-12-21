@@ -77,11 +77,6 @@ def _status_color(part: str) -> str:
     if not p:
         return "#64748b"
 
-    # 🔴 死亡：最高优先级，强制红色
-    # （不管后面还有没有别的状态）
-    if "死亡" in p:
-        return COLOR_NEG
-
     # 特殊前缀：单独颜色
     if p.startswith("雷霆"):
         return COLOR_THUNDER
@@ -94,13 +89,12 @@ def _status_color(part: str) -> str:
     if p.startswith(POS_KEYWORDS):
         return COLOR_POS
 
-    # 负面 / 限制
+    # 负面/限制（本体把这些都归为负面色）
     if p.startswith(NEG_KEYWORDS):
         return COLOR_NEG
 
-    # 未知状态：中性灰
+    # 未知状态：用中性灰
     return "#64748b"
-
 
 
 def _render_status_badges(brief: str) -> str:
@@ -150,16 +144,67 @@ def show_rank(snap):
             )
 
 
+def _format_log_line(line: str) -> str:
+    """
+    将战报行做成 HTML：
+    - 【击杀】A → B（...）：A 加粗，B 红色
+    - “X 被击败：...” ：X 红色
+    其他行：正常显示
+    """
+    raw = line.rstrip("\n")
+    esc = html.escape(raw)
+
+    # 1) 【击杀】K → V（reason）
+    # 示例：  · 【击杀】张三(1) → 李四(2)（xxx）
+    kill_re = re.compile(r"(.*?)(【击杀】)(.+?)(\s*→\s*)(.+?)(（.*)")
+    km = kill_re.match(raw)
+    if km:
+        prefix, tag, killer, arrow, victim, rest = km.groups()
+        prefix_e = html.escape(prefix)
+        tag_e = html.escape(tag)
+        killer_e = html.escape(killer.strip())
+        arrow_e = html.escape(arrow)
+        victim_e = html.escape(victim.strip())
+        rest_e = html.escape(rest)
+        return (
+            f"<div style='white-space:pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, \"Liberation Mono\", \"Courier New\", monospace;'>"
+            f"{prefix_e}{tag_e}<b>{killer_e}</b>{arrow_e}<span style='color:{COLOR_NEG};'>{victim_e}</span>{rest_e}"
+            f"</div>"
+        )
+
+    # 2) X 被击败：...
+    # 示例：  · 潘乐一(2) 被击败：全场【霜冻】效果消失…
+    defeated_re = re.compile(r"(.*?)(\b\S+\(\d+\))(\s+被击败[:：].*)")
+    dm = defeated_re.match(raw)
+    if dm:
+        prefix, victim, rest = dm.groups()
+        return (
+            f"<div style='white-space:pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, \"Liberation Mono\", \"Courier New\", monospace;'>"
+            f"{html.escape(prefix)}<span style='color:{COLOR_NEG};'>{html.escape(victim)}</span>{html.escape(rest)}"
+            f"</div>"
+        )
+
+    # 默认：原样
+    return (
+        "<div style='white-space:pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, \"Liberation Mono\", \"Courier New\", monospace;'>"
+        + esc +
+        "</div>"
+    )
+
 def show_log(lines):
     st.subheader("战报（逐行回放）")
     if not lines:
-        st.info("还没有回放内容。点“开始回合”生成本回合逐行回放，然后点“下一行”或开启“自动播放”。")
+        st.info("还没有回放内容。点“开始回合”生成本回合逐行回放，然后点“下一行”。")
         return
-    st.code("\n".join(lines), language="text")
+
+    # 用 markdown 逐行渲染，便于给击杀/被击败做强调样式
+    for ln in lines:
+        st.markdown(_format_log_line(ln), unsafe_allow_html=True)
+
 
 
 # ---- 5) 页面 ----
-st.title("神秘游戏（东滩乱斗）")
+st.title("神秘游戏 presented by dian_mi")
 
 col_btn1, col_btn2, col_btn3, col_btn4, col_btn5 = st.columns([1, 1, 1, 1, 2])
 
@@ -217,7 +262,7 @@ with col_btn4:
         if not st.session_state["autoplay"]:
             st.session_state.pop("autoplay_tick", None)
         st.rerun()
-    st.caption("顺便帮我测试一下bug（")
+    st.caption("手机端建议横屏使用")
 
 with col_btn5:
     st.session_state["autoplay_ms"] = st.slider(
@@ -227,7 +272,7 @@ with col_btn5:
         value=st.session_state["autoplay_ms"],
         step=50,
     )
-    st.write("made by dian_mi（好吧其实是GPT大人神力）")
+    st.write("made by dian_mi")
 
 # ---- 6) 主体两栏 ----
 left, right = st.columns([1.2, 1])

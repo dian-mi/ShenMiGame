@@ -49,6 +49,17 @@ if "current_snap" not in st.session_state:
 if "current_highlights" not in st.session_state:
     st.session_state.current_highlights = []
 
+# 公告开关（首次进入自动弹出一次）
+if "show_announcement" not in st.session_state:
+    st.session_state.show_announcement = False
+if "announcement_seen" not in st.session_state:
+    st.session_state.announcement_seen = False
+
+# 首次进入：自动展开公告一次
+if not st.session_state.announcement_seen:
+    st.session_state.show_announcement = True
+    st.session_state.announcement_seen = True
+
 # 自动播放相关状态（必须先初始化，按钮里会读）
 if "autoplay" not in st.session_state:
     st.session_state.autoplay = False
@@ -204,7 +215,7 @@ def show_log(lines):
 
 
 # ---- 5) 页面 ----
-st.title("神秘游戏（东滩乱斗）")
+st.title("神秘游戏（东滩乱斗） alpha 1.0")
 
 col_btn1, col_btn2, col_btn3, col_btn4, col_btn5 = st.columns([1, 1, 1, 1, 2])
 
@@ -309,3 +320,61 @@ with left:
 
 with right:
     show_log(st.session_state["revealed_lines"])
+
+# =========================
+# 8) 公告区域（页面最底部）
+# =========================
+st.divider()
+
+col_anno_btn, col_anno_space = st.columns([1, 5])
+with col_anno_btn:
+    if st.button("📢 公告 / Announcement"):
+        st.session_state.show_announcement = not st.session_state.show_announcement
+
+if st.session_state.show_announcement:
+    st.markdown(
+        """
+公告
+
+此为网页版，规则与原版完全一致，手机端建议横屏使用
+但是可能会出现一些莫名其妙的bug
+欢迎反馈
+
+如果你也想将自己加入游戏
+或者觉得自己角色太弱势了（
+可以跟我讲一下
+
+另外贴一下目前的胜率表：
+名次  角色(编号)                胜场
+----------------------------------------------
+ 1.  潘乐一( 2)                 996
+ 2.  豆进天(11)                 802
+ 3.  合议庭(16)                 770
+ 4.  郑孑健(14)                 600
+ 5.  增进舒( 8)                 564
+ 6.  施博理(15)                 525
+ 7.  左右脑(24)                 423
+ 8.  mls(10)                   336
+ 9.  施沁皓( 3)                 322
+10.  牵寒( 6)                   275
+11.  Sunnydayorange(26)        264
+12.  豆进天之父(20)             246
+13.  金逸阳( 1)                 242
+14.  众议院(22)                 173
+15.  释延能(19)                 161
+16.  钟无艳(21)                 158
+17.  hewenx( 7)                 150
+18.  更西部(18)                 129
+19.  姚宇涛( 5)                 119
+20.  找自称(25)                 115
+21.  梅雨神(23)                 104
+22.  藕禄(13)                   100
+23.  书法家( 9)                 99
+24.  放烟花(12)                 97
+25.  朱昊泽( 4)                 94
+26.  路济阳(17)                 61
+
+最后，关注电迷谢谢喵
+        """,
+        unsafe_allow_html=True,
+    )

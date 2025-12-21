@@ -262,7 +262,7 @@ with col_btn4:
         if not st.session_state["autoplay"]:
             st.session_state.pop("autoplay_tick", None)
         st.rerun()
-    st.caption("关注电迷谢谢喵")
+    st.caption("建议用电脑游玩，手机端建议横屏游玩，关注电迷谢谢喵")
 
 with col_btn5:
     st.session_state["autoplay_ms"] = st.slider(

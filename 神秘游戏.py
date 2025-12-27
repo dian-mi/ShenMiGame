@@ -9,10 +9,18 @@ import math
 HW_CID = 1001  # NPC: 洪伟
 LDL_CID = 1002  # NPC: 李东雷
 try:
-    import tkinter as tk
+# tkinter is only needed for the desktop GUI.
+# Streamlit/Cloud environments often do not provide Tk.
+try:
+    import tkinter as tk  # type: ignore
+# [patched for Streamlit]     from tkinter import ttk, messagebox  # type: ignore
+except Exception:  # ImportError / TclError etc.
+    tk = None  # type: ignore
+    ttk = None  # type: ignore
+    messagebox = None  # type: ignore
     import tkinter.font as tkfont
-    from tkinter import ttk
-    from tkinter import messagebox
+# [patched for Streamlit]     from tkinter import ttk
+# [patched for Streamlit]     from tkinter import messagebox
 except ModuleNotFoundError:
     # Headless environment (e.g., server / CI): allow importing engine logic without Tk.
     import types as _types
@@ -183,8 +191,6 @@ class Status:
         if getattr(self, "reduce_ttl", 0) > 0:
             parts.append("还原")
 
-        if self.__dict__.get("invincible", False):
-            parts.append("无敌")
         return "；".join(parts)
 @dataclass
 class Role:
@@ -222,8 +228,6 @@ class Engine:
         self.fast_mode = fast_mode
         # Joke mode (UI toggle)
         self.joke_mode = False
-        # Streamlit-friendly: explicit invincibility set (UI toggles)
-        self.invincible_cids = set()
         # Simulation safety: track skill exceptions (even in fast_mode)
         self.skill_exception_count = 0
         self.skill_exception_examples = []  # store a few (cid, exc)
@@ -252,43 +256,6 @@ class Engine:
         self.skill_order: List[int] = []
         self._init_roles()
         self.new_game()
-
-    # ---------- Streamlit helpers ----------
-    def tick_alive_turns(self) -> None:
-        """Increment per-role alive turn counters.
-
-        Streamlit UI calls this before each next_turn() to mirror the desktop
-        version's bookkeeping. The engine rules do not depend on this value.
-        """
-        for cid, r in self.roles.items():
-            if not r.alive:
-                continue
-            try:
-                r.mem["alive_turns"] = int(r.mem.get("alive_turns", 0)) + 1
-            except Exception:
-                r.mem["alive_turns"] = 1
-
-    def set_invincible(self, cid: int, enable: bool = True) -> None:
-        """Enable/disable invincibility for a character.
-
-        When enabled, the character ignores all kill attempts (including world rules).
-        Intended for UI/debug modes.
-        """
-        if not hasattr(self, "invincible_cids") or self.invincible_cids is None:
-            self.invincible_cids = set()
-        if enable:
-            self.invincible_cids.add(cid)
-        else:
-            try:
-                self.invincible_cids.discard(cid)
-            except Exception:
-                pass
-        try:
-            if cid in self.roles:
-                self.roles[cid].status.__dict__["invincible"] = bool(enable)
-        except Exception:
-            pass
-
     def _init_roles(self):
         # 删除：潘乐一(2)、姚宇涛(5)、众议院(22)
         data = [
@@ -798,14 +765,6 @@ class Engine:
              bypass_revive: bool = False):
         if victim not in self.roles or not self.roles[victim].alive:
             return False
-        # Streamlit/desktop UI toggle: explicit invincibility set
-        try:
-            if victim in getattr(self, "invincible_cids", set()):
-                self._log(f"  · {self.N(victim)} 无敌：免疫本次淘汰")
-                return False
-        except Exception:
-            pass
-
         # Joke mode: 找自称(25) is invincible (immune to everything, including world rules)
         if self.joke_mode and victim == 25:
             self._log("  · 找自称(25) 无敌：免疫本次淘汰")
@@ -3884,7 +3843,7 @@ def main():
         except Exception:
             pass
         UI(root)
-        root.mainloop()
+# [patched for Streamlit]         root.mainloop()
     except Exception:
         import traceback
         tb = traceback.format_exc()

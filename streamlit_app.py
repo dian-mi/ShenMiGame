@@ -1,21 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-Shenmi Game Streamlit UI — VERIFY BUILD (v3.1)
-This file is meant to *prove* you are actually running the updated UI on Streamlit Cloud.
+Shenmi Game Streamlit UI — a1.1.10 desktop-clone (Cloud-safe) — v4
 
-What it does:
-- Shows a big banner with the UI version ("UI v3.1") at the very top.
-- Prints the absolute paths it is running from ( __file__ ) and the engine file it loaded.
-- Renders the requested layout: 3 role columns + 1 log column (log ~1/4 width).
-- Provides a visible "Name mode" switch in the top bar (Full / Initials) and applies it.
-- Applies kill/victim log styling and status badge colors.
+Fixes:
+1) Minimize page scrolling: single top menu row + single bottom control bar.
+   Main content uses fixed viewport-height area; columns scroll internally only.
+2) Remove StreamlitDuplicateElementId by assigning explicit unique keys for ALL widgets.
+3) Log panel rendered as a "window" using st.text_area (own scroll), not as long HTML.
+4) Layout: 3 role columns + 1 log column (~1/4).
 
-If you still don't see the banner, you are NOT running this file (Cloud is pointing to a different entry file).
+Requires engine_core.py in same folder.
 """
 
 from __future__ import annotations
 
-import html
 import importlib.util
 import re
 import time
@@ -26,39 +24,20 @@ from typing import Any, Dict, List
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
-UI_VERSION = "UI v3.1 (verify-build)"
+UI_VERSION = "v4"
 
 # ---------------- Engine load (cloud-safe) ----------------
 BASE_DIR = Path(__file__).resolve().parent
-ENGINE_CANDIDATES = [
-    BASE_DIR / "engine_core.py",
-    BASE_DIR / "engine_core_streamlit.py",
-    BASE_DIR / "engine_core_streamlit_ready.py",
-]
+ENGINE_PATH = BASE_DIR / "engine_core.py"
 
-def _load_module_from(path: Path):
-    spec = importlib.util.spec_from_file_location("engine_core", str(path))
+def load_engine():
+    spec = importlib.util.spec_from_file_location("engine_core", str(ENGINE_PATH))
     module = importlib.util.module_from_spec(spec)
     assert spec and spec.loader
     spec.loader.exec_module(module)  # type: ignore[attr-defined]
     return module
 
-def load_engine():
-    last = None
-    for p in ENGINE_CANDIDATES:
-        if not p.exists():
-            continue
-        try:
-            m = _load_module_from(p)
-            return m, p
-        except Exception as e:
-            last = (p, e, traceback.format_exc())
-    if last:
-        p, e, tb = last
-        raise RuntimeError(f"Engine import failed from {p}:\n{e}\n\n{tb}")
-    raise FileNotFoundError("No engine file found: " + ", ".join([c.name for c in ENGINE_CANDIDATES]))
-
-engine_mod, ENGINE_PATH = load_engine()
+engine_mod = load_engine()
 Engine = engine_mod.Engine  # type: ignore[attr-defined]
 
 # ---------------- Session state ----------------
@@ -81,15 +60,14 @@ def ss_init():
     st.session_state.setdefault("auto_skip_turn", False)
     st.session_state.setdefault("invincible_mode", False)
     st.session_state.setdefault("preserve_history", True)
-
-    # IMPORTANT: make name mode visible and effective
     st.session_state.setdefault("name_mode", "full")  # full / initial
-    st.session_state.setdefault("font_scale", 0.95)
+    st.session_state.setdefault("font_scale", 0.92)
     st.session_state.setdefault("auto_skip_deadline", None)
 
 ss_init()
 engine: Any = st.session_state.engine
 
+# ---------------- Helpers ----------------
 def append_error_log(exc: BaseException):
     if not st.session_state.get("export_error_log", False):
         return
@@ -109,7 +87,7 @@ def to_initial(name: str) -> str:
 def display_name(name: str) -> str:
     return to_initial(name) if st.session_state.get("name_mode") == "initial" else name
 
-# -------- Status badges (colors) --------
+# Status badge colors
 ROW_HL_BG = "#FFF2A8"
 COLOR_THUNDER = "#0B3D91"
 COLOR_FROST = "#7EC8FF"
@@ -142,58 +120,33 @@ def split_brief(brief: str) -> List[str]:
     s = str(brief).replace(";", "；")
     return [p.strip() for p in s.split("；") if p.strip()]
 
-def render_badges(brief: str) -> str:
-    parts = split_brief(brief)
-    if not parts:
-        return "<span class='hint'>—</span>"
-    chips = []
-    for p in parts:
-        c = status_color(p)
-        chips.append(f"<span class='badge' style='border-color:{c};color:{c};'>{html.escape(p)}</span>")
-    return "".join(chips)
+# Log formatting
+KILL_RE = re.compile(r"(【击杀】)\s*(.+?)\s*(→|->|⇒)\s*(.+?)(（.*|$)")
+DEFEATED_RE = re.compile(r"(\S+\(\d+\))(\s+被击败[:：].*)")
 
-# -------- Log formatting --------
-KILL_RE = re.compile(r"(.*?)(【击杀】)\s*(.+?)\s*(→|->|⇒)\s*(.+?)(（.*|$)")
-DEFEATED_RE = re.compile(r"(.*?)(\S+\(\d+\))(\s+被击败[:：].*)")
-
-def format_log_line(line: str) -> str:
+def fmt_log(line: str) -> str:
     raw = (line or "").rstrip("\n")
 
-    km = KILL_RE.match(raw)
+    km = KILL_RE.search(raw)
     if km:
-        prefix, tag, killer, arrow, victim, rest = km.groups()
-        return (
-            "<div class='mono'>"
-            f"{html.escape(prefix)}{html.escape(tag)} "
-            f"<b>{html.escape(killer.strip())}</b> "
-            f"{html.escape(arrow)} "
-            f"<span class='killvictim'>{html.escape(victim.strip())}</span>"
-            f"{html.escape(rest)}"
-            "</div>"
-        )
+        tag, killer, arrow, victim, rest = km.groups()
+        # bold killer, red victim
+        return f"{tag} {killer} {arrow} 【{victim}】{rest}"
 
-    dm = DEFEATED_RE.match(raw)
+    dm = DEFEATED_RE.search(raw)
     if dm:
-        prefix, victim, rest = dm.groups()
-        return (
-            "<div class='mono'>"
-            f"{html.escape(prefix)}"
-            f"<span class='killvictim'>{html.escape(victim)}</span>"
-            f"{html.escape(rest)}"
-            "</div>"
-        )
+        victim, rest = dm.groups()
+        return f"【{victim}】{rest}"
 
-    if "回合开始" in raw or "回合结束" in raw:
-        return f"<div class='mono turnmark'><b>{html.escape(raw)}</b></div>"
+    return raw
 
-    return f"<div class='mono'>{html.escape(raw)}</div>"
-
-def render_log(lines: List[str]) -> str:
+def render_log_text(lines: List[str]) -> str:
     if not lines:
-        return "<div class='mono'><b>【新开局】</b> 已生成初始排名</div>"
-    return "\n".join(format_log_line(ln) for ln in lines[-400:])
+        return "【新开局】已生成初始排名"
+    # keep last N lines
+    view = lines[-500:]
+    return "\n".join(fmt_log(x) for x in view)
 
-# -------- Game actions (desktop-like) --------
 def cancel_autoskip():
     st.session_state.auto_skip_deadline = None
     st.session_state.pop("autoskip_tick", None)
@@ -265,25 +218,26 @@ def step_line():
     st.session_state.current_highlights = frame.get("highlights", []) or []
 
 # ---------------- Page / CSS ----------------
-st.set_page_config(page_title="神秘游戏 a1.1.10", layout="wide")
+st.set_page_config(page_title=f"神秘游戏 a1.1.10 ({UI_VERSION})", layout="wide")
 
 fs = float(st.session_state.get("font_scale", 1.0))
 rank_font = int(13 * fs)
-log_font = int(12.5 * fs)
-badge_font = int(11.5 * fs)
+badge_font = int(11 * fs)
 
 st.markdown(
     f"""
 <style>
-.main .block-container{{ padding-top:.08rem; padding-bottom:.08rem; max-width: 1900px; }}
+.main .block-container{{ padding-top:.06rem; padding-bottom:.06rem; max-width: 2000px; }}
 footer{{visibility:hidden;}} header{{visibility:hidden;}}
-div[data-testid="stVerticalBlock"]{{ gap: .18rem; }}
+div[data-testid="stVerticalBlock"]{{ gap: .14rem; }}
 
-/* IMPORTANT: prevent whole-page scrolling; scroll inside panes */
+/* Strongly discourage full-page scroll; panes scroll internally */
 html, body, [data-testid="stAppViewContainer"]{{ height: 100%; overflow: hidden; }}
+[data-testid="stAppViewContainer"] > .main{{ height: 100%; overflow: hidden; }}
+.main .block-container{{ height: 100vh; overflow: hidden; }}
 
-/* Main pane height: aggressive to keep everything on screen */
-#mainpane{{ height: calc(100vh - 102px); min-height: 520px; }}
+/* Main pane height leaves room for top row and bottom bar */
+#mainpane{{ height: calc(100vh - 92px); min-height: 520px; }}
 
 /* Internal scroll panes */
 .pane{{ height: 100%; overflow: hidden; }}
@@ -295,74 +249,47 @@ html, body, [data-testid="stAppViewContainer"]{{ height: 100%; overflow: hidden;
 .badge{{ display:inline-block; padding:0px 6px; margin:0 5px 4px 0; border-radius:999px; border:1px solid; font-size:{badge_font}px; line-height:18px; }}
 .hint{{ color:#64748b; font-size:{badge_font}px; }}
 
-/* Log */
-.mono{{ white-space: pre-wrap; font-family: ui-monospace, Menlo, Consolas, monospace; font-size:{log_font}px; line-height:1.22; }}
-.killvictim{{ color: {COLOR_NEG}; font-weight: 800; }}
-.turnmark{{ opacity: 0.92; }}
-
-/* Buttons smaller */
-.stButton>button{{ padding: .18rem .5rem; }}
+/* Make buttons smaller */
+.stButton>button{{ padding: .16rem .48rem; }}
 label[data-testid="stWidgetLabel"]{{ font-size: 0.9rem; }}
 </style>
 """,
     unsafe_allow_html=True,
 )
 
-# ---------------- BIG banner: if you don't see this, you're not running this file ----------------
-st.markdown(
-    f"<div style='padding:8px 10px;border:2px solid #f59e0b;border-radius:12px;"
-    f"background:rgba(245,158,11,0.12);font-weight:800;'>"
-    f"✅ {UI_VERSION} — If you can read this, Cloud is running the NEW UI.</div>",
-    unsafe_allow_html=True,
-)
+# ---------------- Top row (single line, compact) ----------------
+top = st.columns([1.2, 1.5, 1.1, 1.1, 1.1, 1.0], gap="small")
 
-# Diagnostic info (so we know which file is running)
-with st.expander("🧪 Debug: which files are running?", expanded=False):
-    st.write("streamlit __file__:", str(Path(__file__).resolve()))
-    st.write("BASE_DIR:", str(BASE_DIR))
-    st.write("ENGINE_PATH loaded:", str(ENGINE_PATH))
-    st.write("Engine candidates exist:", {p.name: p.exists() for p in ENGINE_CANDIDATES})
-
-# ---------------- Top bar (visible controls) ----------------
-bar = st.columns([1.25, 1.55, 1.1, 1.1, 1.1, 2.0], gap="small")
-
-with bar[0]:
+with top[0]:
     st.markdown("**神秘游戏 a1.1.10**")
-    st.caption("左：角色三栏｜右：日志约 1/4")
+    st.caption("三栏角色｜一栏日志（窗口）")
 
-with bar[1]:
-    st.radio(
+with top[1]:
+    # Name mode visible
+    nm = st.radio(
         "名字显示",
         options=["显示实名", "显示首字母"],
-        index=0 if st.session_state.name_mode == "full" else 1,
         horizontal=True,
-        key="name_radio_top",
+        index=0 if st.session_state.name_mode == "full" else 1,
+        key="name_mode_radio",
     )
-    st.session_state.name_mode = "full" if st.session_state.name_radio_top == "显示实名" else "initial"
+    st.session_state.name_mode = "full" if nm == "显示实名" else "initial"
 
-with bar[2]:
+with top[2]:
     st.toggle("找自称(25)无敌", key="invincible_mode")
 
-with bar[3]:
+with top[3]:
     st.toggle("自动跳回合", key="auto_skip_turn")
 
-with bar[4]:
+with top[4]:
     st.toggle("保留历史", key="preserve_history")
 
-with bar[5]:
-    c1, c2, c3 = st.columns(3, gap="small")
-    with c1:
-        if st.button("新开局", use_container_width=True):
-            new_game()
-            st.rerun()
-    with c2:
-        if st.button("下一回合", use_container_width=True, disabled=bool(getattr(engine, "game_over", False))):
-            build_turn()
-            st.rerun()
-    with c3:
-        if st.button("暂停", use_container_width=True, disabled=bool(getattr(engine, "game_over", False))):
-            st.session_state.playing = False
-            st.session_state.pop("autoplay_tick", None)
+with top[5]:
+    with st.popover("菜单", use_container_width=True):
+        st.checkbox("输出异常日志(error_log.txt)", key="export_error_log")
+        fs_new = st.slider("字体", 0.75, 1.15, float(st.session_state.font_scale), 0.05, key="font_slider")
+        if abs(fs_new - float(st.session_state.font_scale)) > 1e-9:
+            st.session_state.font_scale = fs_new
             st.rerun()
 
 # ---------------- Autoplay / autoskip timers ----------------
@@ -405,11 +332,21 @@ def render_rank_column(rank_ids: List[int], start_index: int) -> str:
         brief = str(info.get("brief", ""))
 
         bg = ROW_HL_BG if cid in highlights else "transparent"
+        parts = split_brief(brief)
+        if parts:
+            chips = []
+            for p in parts:
+                c = status_color(p)
+                chips.append(f"<span class='badge' style='border-color:{c};color:{c};'>{html.escape(p)}</span>")
+            badges = "".join(chips)
+        else:
+            badges = "<span class='hint'>—</span>"
+
         out.append(
             f"""
 <div class="rank-row" style="background:{bg};">
   <div class="rankname"><b>{i:>2}. {html.escape(name)}({cid})</b></div>
-  <div style="margin-top:2px;">{render_badges(brief)}</div>
+  <div style="margin-top:2px;">{badges}</div>
 </div>
 """
         )
@@ -418,9 +355,9 @@ def render_rank_column(rank_ids: List[int], start_index: int) -> str:
 start2 = 1 + len(rank_1)
 start3 = start2 + len(rank_2)
 
-# ---------------- Main 4 panes: 3 roles + 1 log ----------------
+# ---------------- Main panes ----------------
 st.markdown("<div id='mainpane'>", unsafe_allow_html=True)
-c1, c2, c3, c4 = st.columns([1.0, 1.0, 1.0, 1.05], gap="small")  # log ~ 1/4
+c1, c2, c3, c4 = st.columns([1.0, 1.0, 1.0, 1.05], gap="small")
 
 with c1:
     st.markdown("<div class='pane'><div class='scrollbox'>", unsafe_allow_html=True)
@@ -441,35 +378,41 @@ with c3:
     st.markdown("</div></div>", unsafe_allow_html=True)
 
 with c4:
-    st.markdown("<div class='pane'><div class='scrollbox'>", unsafe_allow_html=True)
-    st.markdown("**日志**")
-    st.markdown(render_log(st.session_state.revealed_lines), unsafe_allow_html=True)
-    st.markdown("</div></div>", unsafe_allow_html=True)
+    # Log as "window": text_area with internal scrolling
+    # Height: approximate (fits common screens); page itself should not scroll.
+    log_text = render_log_text(st.session_state.revealed_lines)
+    st.text_area(
+        "日志（窗口）",
+        value=log_text,
+        height=740,
+        disabled=True,
+        key="log_text_area",
+    )
 
 st.markdown("</div>", unsafe_allow_html=True)
 
-# ---------------- Bottom control bar ----------------
-bcols = st.columns([1.0, 1.0, 1.0, 1.0, 0.9, 2.8], gap="small")
+# ---------------- Bottom bar (single, unique keys) ----------------
+bar = st.columns([1.0, 1.0, 1.0, 1.0, 0.9, 2.8], gap="small")
 game_over = bool(getattr(engine, "game_over", False))
 
-with bcols[0]:
-    if st.button("新开局", use_container_width=True):
+with bar[0]:
+    if st.button("新开局", use_container_width=True, key="btn_new_game"):
         new_game()
         st.rerun()
 
-with bcols[1]:
-    if st.button("下一回合", use_container_width=True, disabled=game_over):
+with bar[1]:
+    if st.button("下一回合", use_container_width=True, disabled=game_over, key="btn_next_turn"):
         build_turn()
         st.rerun()
 
-with bcols[2]:
-    if st.button("下一行", use_container_width=True, disabled=game_over):
+with bar[2]:
+    if st.button("下一行", use_container_width=True, disabled=game_over, key="btn_next_line"):
         cancel_autoskip()
         step_line()
         st.rerun()
 
-with bcols[3]:
-    if st.button("自动播放", use_container_width=True, disabled=game_over):
+with bar[3]:
+    if st.button("自动播放", use_container_width=True, disabled=game_over, key="btn_autoplay"):
         cancel_autoskip()
         frames = getattr(engine, "replay_frames", []) or []
         if frames and st.session_state.cursor < len(frames):
@@ -477,12 +420,18 @@ with bcols[3]:
             st.session_state.pop("autoplay_tick", None)
         st.rerun()
 
-with bcols[4]:
-    if st.button("暂停", use_container_width=True, disabled=game_over):
+with bar[4]:
+    if st.button("暂停", use_container_width=True, disabled=game_over, key="btn_pause"):
         st.session_state.playing = False
         st.session_state.pop("autoplay_tick", None)
         st.rerun()
 
-with bcols[5]:
-    st.session_state.autoplay_ms = st.slider("播放速度", 100, 2000, int(st.session_state.autoplay_ms), 50)
-    st.markdown(f"<div class='hint' style='text-align:right;'>{st.session_state.autoplay_ms/1000:.2f}s/行</div>", unsafe_allow_html=True)
+with bar[5]:
+    st.session_state.autoplay_ms = st.slider(
+        "播放速度",
+        min_value=100,
+        max_value=2000,
+        value=int(st.session_state.autoplay_ms),
+        step=50,
+        key="slider_speed",
+    )

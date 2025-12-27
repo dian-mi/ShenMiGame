@@ -1,19 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-Shenmi Game Streamlit UI — a1.1.10 desktop-clone (Cloud-safe) — v4
+Shenmi Game Streamlit UI — a1.1.10 desktop-clone (Cloud-safe) — v5 (rich log)
 
-Fixes:
-1) Minimize page scrolling: single top menu row + single bottom control bar.
-   Main content uses fixed viewport-height area; columns scroll internally only.
-2) Remove StreamlitDuplicateElementId by assigning explicit unique keys for ALL widgets.
-3) Log panel rendered as a "window" using st.text_area (own scroll), not as long HTML.
-4) Layout: 3 role columns + 1 log column (~1/4).
+Requested:
+- Log panel with rich text: killer bold, victim red, key markers bold.
+- Log panel is a fixed-height "window" with internal scroll (no page scroll).
+- Fix DuplicateElementId by explicit unique keys for all widgets.
+- Layout: 3 role columns + 1 log column (~1/4 width).
 
-Requires engine_core.py in same folder.
+Requires: engine_core.py in same folder (no tkinter).
 """
 
 from __future__ import annotations
 
+import html
 import importlib.util
 import re
 import time
@@ -23,8 +23,9 @@ from typing import Any, Dict, List
 
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
+import streamlit.components.v1 as components
 
-UI_VERSION = "v4"
+UI_VERSION = "v5"
 
 # ---------------- Engine load (cloud-safe) ----------------
 BASE_DIR = Path(__file__).resolve().parent
@@ -120,33 +121,94 @@ def split_brief(brief: str) -> List[str]:
     s = str(brief).replace(";", "；")
     return [p.strip() for p in s.split("；") if p.strip()]
 
-# Log formatting
-KILL_RE = re.compile(r"(【击杀】)\s*(.+?)\s*(→|->|⇒)\s*(.+?)(（.*|$)")
-DEFEATED_RE = re.compile(r"(\S+\(\d+\))(\s+被击败[:：].*)")
+# ---------------- Rich log formatting ----------------
+# Typical line: "  · 【击杀】 A(12) → B(34)（原因...）"
+KILL_RE = re.compile(r"^(?P<prefix>.*?)(?P<tag>【击杀】)\s*(?P<killer>.+?)\s*(?P<arrow>→|->|⇒)\s*(?P<victim>.+?)(?P<rest>（.*|$)")
+# Typical line: "X(12) 被击败：..."
+DEFEATED_RE = re.compile(r"^(?P<prefix>.*?)(?P<victim>\S+\(\d+\))(?P<rest>\s+被击败[:：].*)$")
 
-def fmt_log(line: str) -> str:
+def format_log_line_html(line: str) -> str:
     raw = (line or "").rstrip("\n")
-
-    km = KILL_RE.search(raw)
+    km = KILL_RE.match(raw)
     if km:
-        tag, killer, arrow, victim, rest = km.groups()
-        # bold killer, red victim
-        return f"{tag} {killer} {arrow} 【{victim}】{rest}"
+        d = km.groupdict()
+        return (
+            f"<div class='logline'>"
+            f"{html.escape(d['prefix'])}"
+            f"<span class='tag'>{html.escape(d['tag'])}</span> "
+            f"<b class='killer'>{html.escape(d['killer'].strip())}</b> "
+            f"<span class='arrow'>{html.escape(d['arrow'])}</span> "
+            f"<span class='victim'>{html.escape(d['victim'].strip())}</span>"
+            f"{html.escape(d['rest'])}"
+            f"</div>"
+        )
 
-    dm = DEFEATED_RE.search(raw)
+    dm = DEFEATED_RE.match(raw)
     if dm:
-        victim, rest = dm.groups()
-        return f"【{victim}】{rest}"
+        d = dm.groupdict()
+        return (
+            f"<div class='logline'>"
+            f"{html.escape(d['prefix'])}"
+            f"<span class='victim'>{html.escape(d['victim'])}</span>"
+            f"{html.escape(d['rest'])}"
+            f"</div>"
+        )
 
-    return raw
+    # Make turn markers bold
+    if ("回合开始" in raw) or ("回合结束" in raw):
+        return f"<div class='logline turnmark'><b>{html.escape(raw)}</b></div>"
 
-def render_log_text(lines: List[str]) -> str:
+    return f"<div class='logline'>{html.escape(raw)}</div>"
+
+def render_log_window(lines: List[str], height_px: int) -> None:
     if not lines:
-        return "【新开局】已生成初始排名"
-    # keep last N lines
-    view = lines[-500:]
-    return "\n".join(fmt_log(x) for x in view)
+        body = "<div class='logline'><b>【新开局】</b> 已生成初始排名</div>"
+    else:
+        # keep last N
+        view = lines[-700:]
+        body = "\n".join(format_log_line_html(ln) for ln in view)
 
+    # standalone html with internal scroll
+    doc = f"""
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  html, body {{ margin:0; padding:0; }}
+  .frame {{
+    height: {height_px}px;
+    overflow-y: auto;
+    border: 1px solid rgba(49,51,63,0.22);
+    border-radius: 10px;
+    padding: 10px 12px;
+    background: rgba(0,0,0,0.02);
+    box-sizing: border-box;
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-size: 12.5px;
+    line-height: 1.25;
+  }}
+  .logline {{ white-space: pre-wrap; }}
+  .tag {{ font-weight: 800; }}
+  .killer {{ font-weight: 800; }}
+  .victim {{ color: {COLOR_NEG}; font-weight: 900; }}
+  .arrow {{ opacity: 0.85; }}
+  .turnmark {{ opacity: 0.95; }}
+</style>
+</head>
+<body>
+  <div class="frame" id="frame">{body}</div>
+  <script>
+    // Auto-scroll to bottom (desktop-like)
+    const el = document.getElementById("frame");
+    el.scrollTop = el.scrollHeight;
+  </script>
+</body>
+</html>
+"""
+    components.html(doc, height=height_px + 6, scrolling=False)
+
+# ---------------- Game actions (desktop-like) ----------------
 def cancel_autoskip():
     st.session_state.auto_skip_deadline = None
     st.session_state.pop("autoskip_tick", None)
@@ -231,12 +293,12 @@ st.markdown(
 footer{{visibility:hidden;}} header{{visibility:hidden;}}
 div[data-testid="stVerticalBlock"]{{ gap: .14rem; }}
 
-/* Strongly discourage full-page scroll; panes scroll internally */
+/* Strongly discourage full-page scroll */
 html, body, [data-testid="stAppViewContainer"]{{ height: 100%; overflow: hidden; }}
 [data-testid="stAppViewContainer"] > .main{{ height: 100%; overflow: hidden; }}
 .main .block-container{{ height: 100vh; overflow: hidden; }}
 
-/* Main pane height leaves room for top row and bottom bar */
+/* Main pane: leaves room for top row + bottom bar */
 #mainpane{{ height: calc(100vh - 92px); min-height: 520px; }}
 
 /* Internal scroll panes */
@@ -249,7 +311,7 @@ html, body, [data-testid="stAppViewContainer"]{{ height: 100%; overflow: hidden;
 .badge{{ display:inline-block; padding:0px 6px; margin:0 5px 4px 0; border-radius:999px; border:1px solid; font-size:{badge_font}px; line-height:18px; }}
 .hint{{ color:#64748b; font-size:{badge_font}px; }}
 
-/* Make buttons smaller */
+/* Buttons smaller */
 .stButton>button{{ padding: .16rem .48rem; }}
 label[data-testid="stWidgetLabel"]{{ font-size: 0.9rem; }}
 </style>
@@ -257,15 +319,13 @@ label[data-testid="stWidgetLabel"]{{ font-size: 0.9rem; }}
     unsafe_allow_html=True,
 )
 
-# ---------------- Top row (single line, compact) ----------------
-top = st.columns([1.2, 1.5, 1.1, 1.1, 1.1, 1.0], gap="small")
-
+# ---------------- Top row (compact, single line) ----------------
+top = st.columns([1.2, 1.55, 1.1, 1.1, 1.1, 1.0], gap="small")
 with top[0]:
     st.markdown("**神秘游戏 a1.1.10**")
-    st.caption("三栏角色｜一栏日志（窗口）")
+    st.caption("三栏角色｜一栏日志（富文本窗口）")
 
 with top[1]:
-    # Name mode visible
     nm = st.radio(
         "名字显示",
         options=["显示实名", "显示首字母"],
@@ -316,7 +376,7 @@ rank: List[int] = snap.get("rank", []) or []
 status_map: Dict[int, Dict[str, Any]] = snap.get("status", {}) or {}
 highlights = set(st.session_state.get("current_highlights", []) or [])
 
-# Split into 3 columns
+# Split rank into 3 columns
 n = len(rank)
 a = (n + 2) // 3
 b = (n + 1) // 3
@@ -378,20 +438,16 @@ with c3:
     st.markdown("</div></div>", unsafe_allow_html=True)
 
 with c4:
-    # Log as "window": text_area with internal scrolling
-    # Height: approximate (fits common screens); page itself should not scroll.
-    log_text = render_log_text(st.session_state.revealed_lines)
-    st.text_area(
-        "日志（窗口）",
-        value=log_text,
-        height=740,
-        disabled=True,
-        key="log_text_area",
-    )
+    # Rich-text log window with internal scroll (no page scroll)
+    st.markdown("**日志**")
+    # We want a height that fits most screens without forcing page scroll.
+    # This is independent from CSS mainpane; it only affects the log window iframe height.
+    log_height = 680
+    render_log_window(st.session_state.revealed_lines, height_px=log_height)
 
 st.markdown("</div>", unsafe_allow_html=True)
 
-# ---------------- Bottom bar (single, unique keys) ----------------
+# ---------------- Bottom bar (unique keys) ----------------
 bar = st.columns([1.0, 1.0, 1.0, 1.0, 0.9, 2.8], gap="small")
 game_over = bool(getattr(engine, "game_over", False))
 

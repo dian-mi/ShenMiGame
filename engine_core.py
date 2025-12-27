@@ -3851,5 +3851,3 @@ __all__ = ["Engine", "GameEngine"]
 
 # Engine version for debugging
 ENGINE_VERSION = "1.0.0"
-GameEngine = Engine
-

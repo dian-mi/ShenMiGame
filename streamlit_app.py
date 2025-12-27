@@ -3,8 +3,10 @@ import time
 import importlib
 import streamlit as st
 
-st.write("UI VERSION: v3-2025-12-27")
-st.set_page_config(page_title="神秘游戏", layout="wide")
+st.set_page_config(page_title="神秘游戏", layout="wide")  # ✅ 必须第一条 st.* 命令
+
+st.write("UI VERSION: v3-2025-12-27")  # ✅ 放到这里就不会报错了
+
 
 # ----------------------------
 # CSS: emulate a1.1.10 (3 panels, list rows, separators, selected yellow)

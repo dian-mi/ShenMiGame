@@ -1,106 +1,166 @@
 # -*- coding: utf-8 -*-
 """
 神秘游戏 推演模拟器（Tkinter）
-- 左侧：存活排名（占屏幕大部分）
-- 右侧：滚动战报（第N回合开始、世界处决、谁放技能、谁击杀谁、死亡触发、更新等）
-- 底部：新开局 / 下一回合
-
-规则与技能以用户提供的“游戏规则推演提示词”为准（含：世界规则、补刀、护盾、封印/遗忘/遗策、双生、集火、挡刀等）。
 """
+import random
+import re
+import math
 
-# --- Tkinter 仅用于桌面GUI；云端/网页环境可能没有 _tkinter ---
+HW_CID = 1001  # NPC: 洪伟
+LDL_CID = 1002  # NPC: 李东雷
 try:
     import tkinter as tk
     import tkinter.font as tkfont
     from tkinter import ttk
-    TK_AVAILABLE = True
-except Exception:
-    tk = None
+    from tkinter import messagebox
+except ModuleNotFoundError:
+    # Headless environment (e.g., server / CI): allow importing engine logic without Tk.
+    import types as _types
+    tk = _types.SimpleNamespace(Tk=object)
     tkfont = None
     ttk = None
-    TK_AVAILABLE = False
+    messagebox = None
 
-import random
-import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Any
-
-
-
-
+from typing import Any, Dict, List, Optional, Tuple
+# =========================
+# Windows DPI Awareness (avoid blur on 4K/HiDPI)
+# =========================
+def set_dpi_awareness():
+    """Make Tkinter app DPI-aware on Windows so it won't look blurry on 4K displays."""
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # Per-monitor DPI aware (Win 8.1+)
+    except Exception:
+        try:
+            import ctypes
+            ctypes.windll.user32.SetProcessDPIAware()  # System DPI aware (older)
+        except Exception:
+            pass
 # =========================
 # 数据结构
 # =========================
-
 @dataclass
 class Status:
-    # 通用状态
-    shields: int = 0                 # 护盾层数（最多2）
-    shield_ttl: int = 0              # 临时护盾持续回合（>0每回合-1，到0清空临时盾；可持续盾用 shield_perm=层数）
-    shield_perm: int = 0             # 可持续护盾层数（不随回合衰减，直到被消耗）
-    thunder: int = 0                 # 雷霆层数（每回合第5/6/7名+1，叠满3立刻死亡）
+    # 通用
+    shields: int = 0          # 临时护盾层数（最多2，与 shield_perm 合计）
+    shield_ttl: int = 0       # 临时护盾持续回合（>0每回合-1，到0清空 shields）
+    shield_perm: int = 0      # 可持续护盾层数（不衰减，直到被消耗）
+    thunder: int = 0          # 雷霆层数（第5/6/7名每回合+1，叠满3死亡）
+    sealed: int = 0           # 封印剩余回合（主动无效）
+    forgotten: int = 0        # 遗忘剩余回合（主动无效）
+    perma_disabled: bool = False  # 遗策/永久失效（主动+被动都无效）
+    # 集火（重做版）
+    focused: bool = False
+    invisible: bool = False      # 隐身：不会被技能选中（不包括世界规则）
 
-    frost: bool = False             # 霜冻（由潘乐一施加；潘乐一死亡后清除）
+    bomb: bool = False           # 炸弹：姚舒馨(40)烈焰炸弹标记
+    vyzy: bool = False           # 越挫越勇：季任杰(34)棕色状态
+    shenwei: bool = False        # 神威：施禹谦(36)金色状态效果
 
-    sealed: int = 0                  # 封印剩余回合（主动无效）
-    forgotten: int = 0               # 遗忘剩余回合（主动无效）
-    perma_disabled: bool = False     # 遗策/永久失效（主动+被动都无效）
-
-    focused: bool = False            # 集火（本回合随机技能必中目标）
-    dusk_mark: int = 0               # Sunny 死亡触发：黄昏标记（每次发动主动后-1名）
-    next_target_random: bool = False # 留痕：下次技能目标随机
-    doubled_move_next: bool = False  # 厄运预兆：下回合“排名变动效果”翻倍
-
-    # 众议院挡刀
-    guard_for: Optional[int] = None  # 本回合为谁挡刀
-    guard_used: bool = False
-
-    # 钟无艳特殊
-    cant_gain_shield_next: int = 0   # 发动往事皆尘后：下回合无法获得护盾
-    zhong_triggers: int = 0          # 巾帼护盾触发次数（最多3）
-    lonely_pride: bool = False       # 孤傲标签（钟无艳）
-    blessing: int = 0                # 找自称：祝福层数
-
+    fish: bool = False           # 鱼：游鱼归渊牵引
+    dying_ttl: int = 0          # 濒亡：剩余回合数（>0不能行动）
+    attached_life: bool = False  # 附生：携带李知雨残灯复明
+    lone_wolf: bool = False      # 孤军奋战：永久效果
+    spec_immune_ttl: int = 0     # 特异性免疫：剩余回合数（>0本回合无敌，仍受世界规则）
+    spec_immune_gained_this_turn: bool = False  # 本回合是否新获得特异性免疫（用于沈澄婕触发判定）
+    # 说明（新）：focused 不再是“随机技能必中该目标”
+    # 而是“自我反噬集火”：
+    # 若某角色带 focused，则其下一次发动的技能中，只要存在“有概率选中自己”的随机目标判定，
+    # 则该判定必然选中自己；触发后 focused 立即消失。
+    # ——为工程化实现：我们只在“随机选择目标”的 helper 中检查此规则。
+    dusk_mark: int = 0            # Sunny 死亡触发：黄昏标记（每次发动主动后-1名）
+    next_target_random: bool = False  # 留痕：下次技能目标随机
+    doubled_move_next: bool = False   # 厄运预兆：下回合“排名变动效果”翻倍一次
     # mls
-    mls_immune_used: int = 0         # 每局限3次
-    mls_immune_used_this_turn: bool = False  # 每回合第一次受影响判定
-
+    mls_immune_used: int = 0
+    mls_immune_used_this_turn: bool = False
     # 左右脑
-    revives_left: int = 2            # 可复活两次
-
-    # hewenx
+    revives_left: int = 2
+    # hewenx 怨念
     hewenx_curse: Optional[Dict[str, Any]] = None  # {"killer":cid, "threshold_rank":rank_at_death}
-
-    # 施沁皓/姚宇涛联动等
-    yao_substitute_used: bool = False
-
     # Sunny
-    photosyn_energy: int = 0         # 光合能量（最多3）
-    photosyn_watch: Optional[Dict[str, Any]] = None  # {"targets":[a,b,(c)], "remain":2}
-    corrupted: bool = False          # 腐化（紫色显示）
-    sunny_revive_used: bool = False  # Sunny【无中生有】是否已触发（每局一次）
-
-    # 豆父：被动阶段
+    photosyn_energy: int = 0
+    corrupted: bool = False
+    sunny_revive_used: bool = False
+    # 沈澄婕(33) 记录存活者集合（用于“每回合记录存活者获得特异免疫”逻辑）
+    scj_recorded_alive: set = field(default_factory=set)
+    scj_layers: int = 0  # 沈澄婕(33) 记录层数（用于特异免疫获取上限3）
+    # 豆父
     father_world_boost_count: int = 0
     father_world_immune_used: bool = False
+    # 钟无艳（仅保留巾帼护盾计数）
+    zhong_triggers: int = 0
+    # 朱昊泽：绝息效果（剩余回合数，>0 表示对朱昊泽(4)发动技能会被免疫一次）
+    juexi_ttl: int = 0
+    # 随机事件新增状态
+    hongwei_gift_shield: int = 0     # 洪伟之赐：可抵挡一次伤害（相当于盾），>0 表示存在
+    thunder_wrist_shield: int = 0    # 雷霆手腕：可抵挡一次伤害（相当于盾），>0 表示存在
+    oxid_ttl: int = 0                # 氧化：剩余回合（深绿色），每回合上升1名
+    reduce_ttl: int = 0              # 还原：剩余回合（深绿色），每回合下降1名
+
+    witness: bool = False           # 目击：谢承哲破绽洞察
+    defense_ttl: int = 0            # 辩护：剩余回合数（金色），每回合上升1名
+
+    silent_ttl: int = 0           # 静默：严雅
+    detour_ttl: int = 0           # 迂回：陈心如
+    frontline_cd: int = 0         # 迫近战线冷却：张志成
+    defense_line_ttl: int = 0     # 防线：蒋骐键
+    defense_line_block: bool = False  # 防线抵消次数
 
     def total_shields(self) -> int:
         return min(2, max(0, self.shield_perm) + max(0, self.shields))
-
     def brief(self) -> str:
-        parts = []
+        parts: List[str] = []
         if self.total_shields() > 0:
             parts.append(f"护盾{self.total_shields()}")
+        # Joke mode display only
+        if self.__dict__.get("fake_99999", False):
+            parts.append("护盾99999")
         if self.thunder:
             parts.append(f"雷霆{self.thunder}")
-        if self.frost:
-            parts.append("霜冻")
         if self.sealed:
-            parts.append(f"封印{self.sealed}")
+            parts.append("封印")
         if self.forgotten:
             parts.append(f"遗忘{self.forgotten}")
         if self.focused:
             parts.append("集火")
+        if self.invisible:
+            parts.append("隐身")
+        if self.bomb:
+            parts.append("炸弹")
+        if self.vyzy:
+            parts.append("越挫越勇")
+        if getattr(self, "shenwei", False):
+            parts.append("神威")
+        if self.fish:
+            parts.append("鱼")
+        if self.dying_ttl:
+            parts.append(f"濒亡{self.dying_ttl}")
+        if self.attached_life:
+            parts.append("附生")
+        if self.lone_wolf:
+            parts.append("孤军奋战")
+        if self.spec_immune_ttl:
+            parts.append("特异性免疫")
+        if getattr(self, "purify_ttl", 0) > 0:
+            parts.append(f"净化{self.purify_ttl}")
+        if getattr(self, "shenghui_ttl", 0) > 0:
+            parts.append(f"圣辉{self.shenghui_ttl}")
+        if getattr(self, "dian", 0) > 0:
+            parts.append(f"感电{self.dian}")
+        if getattr(self, "chase", 0) > 0:
+            parts.append(f"乘胜追击{self.chase}")
+        if getattr(self, "witness", False):
+            parts.append("目击")
+        if getattr(self, "defense_ttl", 0) > 0:
+            parts.append(f"辩护{self.defense_ttl}")
+        if getattr(self, "silent_ttl", 0) > 0:
+            parts.append(f"静默{self.silent_ttl}")
+        if getattr(self, "detour_ttl", 0) > 0:
+            parts.append(f"迂回{self.detour_ttl}")
+        if getattr(self, "defense_line_ttl", 0) > 0:
+            parts.append(f"防线{self.defense_line_ttl}")
         if self.perma_disabled:
             parts.append("遗策")
         if self.dusk_mark:
@@ -109,17 +169,21 @@ class Status:
             parts.append("留痕")
         if self.doubled_move_next:
             parts.append("厄运")
-        if self.cant_gain_shield_next:
-            parts.append("禁盾")
-        if self.lonely_pride:
-            parts.append("孤傲")
         if self.corrupted:
             parts.append("腐化")
-        if self.blessing:
-            parts.append(f"祝福{self.blessing}")
+        if self.juexi_ttl:
+            parts.append(f"绝息{self.juexi_ttl}")
+
+        if getattr(self, "hongwei_gift_shield", 0) > 0:
+            parts.append("洪伟之赐")
+        if getattr(self, "thunder_wrist_shield", 0) > 0:
+            parts.append("雷霆手腕")
+        if getattr(self, "oxid_ttl", 0) > 0:
+            parts.append("氧化")
+        if getattr(self, "reduce_ttl", 0) > 0:
+            parts.append("还原")
+
         return "；".join(parts)
-
-
 @dataclass
 class Role:
     cid: int
@@ -127,91 +191,158 @@ class Role:
     alive: bool = True
     status: Status = field(default_factory=Status)
     mem: Dict[str, Any] = field(default_factory=dict)
-
-
 @dataclass
 class DeathRecord:
     victim: int
-    killer: Optional[int]  # None 表示世界规则/未知
+    killer: Optional[int]  # None = 世界规则/未知
     reason: str
-
-
 # =========================
 # 引擎
 # =========================
-
 class Engine:
-    def __init__(self, seed: Optional[int] = None):
+    def _error_log_path(self) -> str:
+        import os
+        try:
+            base = os.path.dirname(os.path.abspath(__file__))
+        except Exception:
+            base = os.getcwd()
+        return os.path.join(base, "error_log.txt")
+
+    def _status_sig_no_silent(self, cid: int) -> str:
+        """Return status brief string excluding 静默 for comparisons."""
+        b = self.roles[cid].status.brief()
+        parts = [p for p in b.split("，") if not p.startswith("静默")]
+        return "，".join(parts)
+
+    def __init__(self, seed: Optional[int] = None, fast_mode: bool = False):
         self.rng = random.Random(seed)
+        self.base_seed = seed  # None => fully random each new_game
+        self.fast_mode = fast_mode
+        # Joke mode (UI toggle)
+        self.joke_mode = False
+        # Simulation safety: track skill exceptions (even in fast_mode)
+        self.skill_exception_count = 0
+        self.skill_exception_examples = []  # store a few (cid, exc)
+        self.export_error_log = False
+        self._active_logged = set()
         self.turn = 0
+        self.world_event_triggered_this_turn = False  # 本回合是否触发世界事件
         self.roles: Dict[int, Role] = {}
         self.rank: List[int] = []
         self.log: List[str] = []
-        # 逐行回放（本回合每条log对应一个帧）
+        # 回放帧：每条log一帧（仅非fast_mode）
         self.replay_frames: List[Dict[str, Any]] = []
-        self.replay_turn_id: int = 0
-        self._cid_pat = re.compile(r"\((\d{1,2})\)")
+        self._cid_pat = re.compile(r"\((\d{1,3})\)")
         self.game_over = False
-
-        # 全局
         self.no_death_streak = 0
-        self.twin_pair: Tuple[int, int] = (13, -1)  # -1 表示当前未绑定
+        self.pending_endgame_execute = False
+        self.elimination_order: List[int] = []
+        self.elimination_turn: Dict[int, int] = {}
         self.deaths_this_turn: List[DeathRecord] = []
-        self.start_rank_snapshot: Dict[int, int] = {}  # 用于钟无艳回合末“上升≥2”判断
-
+        self.twin_pair: Tuple[int, int] = (13, -1)  # 13与随机一人绑定；-1表示未绑定
+        # 随机事件NPC
+        self.HW_CID = 1001  # 洪伟
+        self.LDL_CID = 1002  # 李东雷
+        self.start_rank_snapshot: Dict[int, int] = {}
+        # 每局固定的主动技能发动顺序（新规则：开局随机生成，之后每回合按此顺序）
+        self.skill_order: List[int] = []
         self._init_roles()
         self.new_game()
-
     def _init_roles(self):
+        # 删除：潘乐一(2)、姚宇涛(5)、众议院(22)
         data = [
-            (1,"金逸阳"),(2,"潘乐一"),(3,"施沁皓"),(4,"朱昊泽"),
-            (5,"姚宇涛"),(6,"牵寒"),(7,"hewenx"),(8,"增进舒"),
-            (9,"书法家"),(10,"mls"),(11,"豆进天"),(12,"放烟花"),
-            (13,"藕禄"),(14,"郑孑健"),(15,"施博理"),(16,"合议庭"),
-            (17,"路济阳"),(18,"更西部"),(19,"释延能"),(20,"豆进天之父"),
-            (21,"钟无艳"),(22,"众议院"),(23,"梅雨神"),(24,"左右脑"),
-            (25,"找自称"),(26,"Sunnydayorange"),
+            (1, "金逸阳"),
+            (3, "施沁皓"),
+            (4, "朱昊泽"),
+            (6, "牵寒"),
+            (7, "hewenx"),
+            (8, "增进舒"),
+            (9, "书法家"),
+            (10, "mls"),
+            (11, "豆进天"),
+            (12, "放烟花"),
+            (13, "藕禄"),
+            (14, "郑孑健"),
+            (15, "施博理"),
+            (16, "合议庭"),
+            (17, "路济阳"),
+            (18, "更西部"),
+            (19, "释延能"),
+            (20, "豆进天之父"),
+            (21, "钟无艳"),
+            (23, "梅雨神"),
+            (24, "左右脑"),
+            (25, "找自称"),
+            (26, "Sunnydayorange"),
+            (27, "黄伶俐"),
+            (28, "黄梓睿"),
+            (29, "严雅"),
+            (30, "陈心如"),
+            (31, "李知雨"),
+            (32, "范一诺"),
+            (33, "沈澄婕"),
+            (34, "季任杰"),
+            (35, "虞劲枫"),
+            (36, "施禹谦"),
+            (37, "谢承哲"),
+            (38, "陆泽灏"),
+            (39, "朱诚"),
+            (40, "姚舒馨"),
+            (41, "张志成"),
+            (42, "俞守衡"),
+            (43, "卞一宸"),
+            (44, "冷雨霏"),
+            (45, "蒋骐键"),
+            (46, "戚银潞"),
         ]
         self.roles = {cid: Role(cid, name) for cid, name in data}
-
     # ---------- 通用 ----------
+    def N(self, cid: int) -> str:
+        name = self.roles[cid].name.strip()
+        return f"{name}({cid})"
     def alive_ids(self) -> List[int]:
         return [cid for cid in self.rank if self.roles[cid].alive]
-
     def pos(self, cid: int) -> Optional[int]:
         try:
             return self.rank.index(cid)
         except ValueError:
             return None
-
     def rank_no(self, cid: int) -> Optional[int]:
         p = self.pos(cid)
         return None if p is None else p + 1
+    def _compact(self):
+        self.rank = [cid for cid in self.rank if self.roles[cid].alive]
 
-    def N(self, cid: int) -> str:
-        return f"{self.roles[cid].name}({cid})"
+
+    def _check_shenwei_loss(self):
+        """施禹谦(36) 神威：只要不在第一名，立即消失。"""
+        if 36 not in self.roles:
+            return
+        r = self.roles[36]
+        if (not r.alive) or r.status.perma_disabled:
+            return
+        if r.status.shenwei and self.rank_no(36) != 1:
+            before = r.status.brief()
+            r.status.shenwei = False
+            self._log("  · 神威消失：施禹谦(36) 不在第一名 → 神威立刻消失")
+            self._on_status_change(36, before)
 
     def _snapshot(self) -> Dict[str, Any]:
-        # 保存 UI 需要的快照：排名 + 每个角色的alive与brief状态
+        if self.fast_mode:
+            return {"turn": self.turn, "rank": [], "status": {}}
         alive_rank = [cid for cid in self.rank if self.roles[cid].alive]
-        status_map = {}
+        status_map: Dict[int, Any] = {}
         for cid, r in self.roles.items():
-            status_map[cid] = {
-                "alive": r.alive,
-                "brief": r.status.brief(),
-                "name": r.name
-            }
-        return {
-            "turn": self.turn,
-            "rank": alive_rank[:],
-            "status": status_map
-        }
-
+            status_map[cid] = {"alive": r.alive, "brief": r.status.brief(), "name": r.name}
+        return {"turn": self.turn, "rank": alive_rank[:], "status": status_map}
     def _log(self, s: str):
+        if self.fast_mode:
+            return
+        # 日志净化：删除所有全角括号内容（例如（现为2层）、（死亡触发：…）等）
+        # 不影响角色编号形式的半角括号 (cid)
+        s = re.sub(r"（[^）]*）", "", s)
         self.log.append(s)
-
-        # 从日志文本里抓出所有出现过的 (cid)，用于“直播高亮”
-        highlights = []
+        highlights: List[int] = []
         try:
             for m in self._cid_pat.finditer(s):
                 cid = int(m.group(1))
@@ -219,24 +350,34 @@ class Engine:
                     highlights.append(cid)
         except Exception:
             highlights = []
-
-        # 去重但保留顺序
         seen = set()
         highlights = [x for x in highlights if not (x in seen or seen.add(x))]
-
-        # 每条日志记录一帧
-        self.replay_frames.append({
-            "text": s,
-            "snap": self._snapshot(),
-            "highlights": highlights
-        })
-
-
-    def _compact(self):
-        self.rank = [cid for cid in self.rank if self.roles[cid].alive]
-
+        self.replay_frames.append({"text": s, "snap": self._snapshot(), "highlights": highlights})
+    # ---------- 随机目标 helper（实现重做后的“集火”） ----------
+    def pick_random(self, actor: int, pool: List[int], desc: str) -> Optional[int]:
+        """从pool里随机选一个。若actor带 focused，则只要 pool 里包含 actor，必选 actor，并消耗 focused。"""
+        if not pool:
+            return None
+        # 隐身：不会被任何技能选中（不包括世界规则）；因此从技能随机池中剔除隐身目标
+        pool = [x for x in pool if (x == actor) or (not self.roles[x].status.invisible)]
+        if not pool:
+            return None
+        st = self.roles[actor].status
+        if st.focused and actor in pool:
+            st.focused = False
+            self._log(f"  · 集火触发：{self.N(actor)} 的随机判定必选自己（{desc}），集火消失")
+            return actor
+        return self.rng.choice(pool)
+    def set_unique_focus(self, target: int, note: str = ""):
+        """Ensure there is at most one focused on the field: new focus overrides the old one."""
+        for cid, r in self.roles.items():
+            if r.status.focused and cid != target:
+                r.status.focused = False
+        self.roles[target].status.focused = True
+        if note and (not self.fast_mode):
+            self._log(note)
+    # ---------- 护盾 ----------
     def _max2_shield_add(self, st: Status, add: int, ttl: int = 1, perm: bool = False):
-        # 护盾最多叠加2层
         cur = st.total_shields()
         can = max(0, 2 - cur)
         add2 = min(add, can)
@@ -247,35 +388,44 @@ class Engine:
         else:
             st.shields += add2
             st.shield_ttl = max(st.shield_ttl, ttl)
-
     def give_shield(self, cid: int, n: int = 1, ttl: int = 1, perm: bool = False, note: str = ""):
         r = self.roles[cid]
+        before_brief = r.status.brief()
         if not r.alive:
-            return
-        if r.status.lonely_pride and note.startswith("增益"):
-            # 钟无艳：无法成为任何增益技能目标
-            self._log(f"  · {self.N(cid)} 因【孤傲】无法成为增益目标，未获得护盾")
-            return
-        if r.status.cant_gain_shield_next > 0:
-            self._log(f"  · {self.N(cid)} 因【禁盾】无法获得护盾")
             return
         before = r.status.total_shields()
         self._max2_shield_add(r.status, n, ttl=ttl, perm=perm)
         after = r.status.total_shields()
         if after > before:
             self._log(f"  · {self.N(cid)} 获得护盾+{after-before}" + (f"（{note}）" if note else ""))
-
+            self._oulu_bump_on_status_change(cid, before_brief)
     def consume_shield_once(self, cid: int) -> bool:
+        before_brief = self.roles[cid].status.brief()
         st = self.roles[cid].status
-        # 优先消耗临时盾
         if st.shields > 0:
             st.shields -= 1
+            # 找自称(25)：护盾被破后立刻上升5名
+            if cid == 25 and st.shields == 0 and self.roles[25].alive and (not st.perma_disabled):
+                self.move_by(25, -5, source=None, note="护盾被破上升5名")
+            self._oulu_bump_on_status_change(cid, before_brief)
             return True
         if st.shield_perm > 0:
             st.shield_perm -= 1
+            self._oulu_bump_on_status_change(cid, before_brief)
+            return True        # 洪伟之赐 / 雷霆手腕：各自抵挡一次伤害
+        if getattr(st, "hongwei_gift_shield", 0) > 0:
+            st.hongwei_gift_shield = 0
+            self._log(f"  · 洪伟之赐抵死：{self.N(cid)}（消耗）")
+            self._oulu_bump_on_status_change(cid, before_brief)
             return True
-        return False
+        if getattr(st, "thunder_wrist_shield", 0) > 0:
+            st.thunder_wrist_shield = 0
+            self._log(f"  · 雷霆手腕抵死：{self.N(cid)}（消耗）")
+            self._oulu_bump_on_status_change(cid, before_brief)
+            return True
 
+        return False
+    # ---------- 可行动 ----------
     def can_act(self, cid: int) -> bool:
         r = self.roles[cid]
         if not r.alive:
@@ -286,31 +436,192 @@ class Engine:
             return False
         if r.status.forgotten > 0:
             return False
+        if r.status.dying_ttl > 0:
+            return False
         return True
 
-    # ---------- 潘乐一：霜冻免疫（被动【大风机关】） ----------
-    def frost_immune(self, source: Optional[int], target: int, effect_desc: str) -> bool:
-        """若 target 为潘乐一(2)，且 source 携带霜冻，则潘乐一免疫该效果。"""
-        if target != 2:
-            return False
-        if source is None:
+    def _on_status_change(self, cid: int, before: str):
+        """统一处理“状态发生变化”后的被动。before/after 使用 Status.brief()。"""
+        if cid not in self.roles:
+            return
+        after = self.roles[cid].status.brief()
+        if after == before:
+            return
+
+                # 44 冷雨霏：无懈可击——每次自身状态变化，获得1层乘胜追击（最高5）
+        if cid == 44 and self.roles[44].alive and (not self.roles[44].status.perma_disabled):
+            st44 = self.roles[44].status
+            before_chase = getattr(st44, "chase", 0)
+            st44.chase = min(3, before_chase + 1)
+            if st44.chase != before_chase:
+                self._log(f"  · 无懈可击：{self.N(44)} 获得1层【乘胜追击】(当前{st44.chase}/3)")
+
+        # 13 藕禄：风过无痕——状态变化就上升一位
+        if cid == 13 and self.roles[13].alive and (not self.roles[13].status.perma_disabled):
+            self.move_by(13, -1, source=None, note="风过无痕")
+
+        # 33 沈澄婕：特异性免疫（新获得的状态类型立即记录并给予免疫）
+        if cid == 33:
+            self._scj_sync_and_grant()
+
+        # 规则：每次“记录到新的状态效果”时，都获得1回合特异性免疫（仍受世界规则）
+        if cid == 33 and self.roles[33].alive and (not self.roles[33].status.perma_disabled):
+            before_set = set([x for x in before.split("；") if x.strip()])
+            after_set = set([x for x in after.split("；") if x.strip()])
+            gained = [x for x in (after_set - before_set) if x]
+
+            marked = set(self.roles[33].mem.get("scj_marked", []))
+            new_recorded = False
+            for tag in gained:
+                # 雷霆从1到2等升级也视为“获得新特性”并触发特异性免疫
+                if "雷霆" in tag:
+                    new_recorded = True
+                if tag not in marked:
+                    marked.add(tag)
+                    new_recorded = True
+            self.roles[33].mem["scj_marked"] = list(marked)
+
+            if new_recorded:
+                before = self.roles[33].status.spec_immune_ttl
+                self.roles[33].status.spec_immune_ttl = max(self.roles[33].status.spec_immune_ttl, 2)
+                if before == 0 and self.roles[33].status.spec_immune_ttl > 0:
+                    self.roles[33].status.spec_immune_gained_this_turn = True
+                self._log("  · 特异性免疫：记录到新状态 → 本回合无敌（仍受世界规则）")
+                self.move_by(33, -5, source=None, note="特异性免疫强化上升5名")
+
+    def _oulu_bump_on_status_change(self, cid: int, before: str):
+        """藕禄(13) 被动：状态效果发生改变时，排名上升一位。"""
+        if cid != 13:
+            return
+        if (13 not in self.roles) or (not self.roles[13].alive) or self.roles[13].status.perma_disabled:
+            return
+        after = self.roles[13].status.brief()
+        if after != before:
+            self.move_by(13, -1, source=None, note="风过无痕")
+    # ---------- 绝息免疫（朱昊泽重做需求） ----------
+    def _juexi_blocks(self, source: Optional[int], target: int, effect: str) -> bool:
+        """若 source 带绝息且 target 为朱昊泽(4)，则朱昊泽免疫该次技能影响并消耗 source 的绝息。
+        返回 True 表示已被绝息拦截（后续应停止对 target 的作用）。
+        """
+        if target != 4 or source is None:
             return False
         if source not in self.roles:
             return False
-        if not self.roles[2].alive:
+        st = self.roles[source].status
+        if (not self.roles[source].alive) or st.perma_disabled:
             return False
-        # 潘乐一自身永久失效不影响被动免疫（如需受影响可改为检查 perma_disabled）
-        if self.roles[source].alive and self.roles[source].status.frost:
-            self._log(f"  · 大风机关：{self.N(2)} 免疫来自 {self.N(source)} 的效果（{effect_desc}）")
+        if st.juexi_ttl > 0:
+            st.juexi_ttl = 0
+            self._log(f"  · 【绝息免疫】{self.N(4)} 免疫来自 {self.N(source)} 的技能效果（{effect}），并使其绝息消失")
             return True
         return False
 
+    def apply_selection(self, source: Optional[int], target: int, effect: str) -> bool:
+        """统一“被技能选中”入口。返回True表示允许继续；False表示该技能对target无效。
+        - source is None 视为世界规则（不触发隐身/绝地反击/特异免疫等技能免疫）
+        """
+        if target not in self.roles or (not self.roles[target].alive):
+            return False
+
+        # 世界规则不受这些免疫影响
+        if source is None:
+            return True
+
+        # 隐身：不被任何技能选中（不包括世界规则）
+        if self.roles[target].status.invisible:
+            self._log(f"  · 隐身免疫：{self.N(target)} 免疫来自 {self.N(source)} 的技能影响（{effect}）")
+            return False
+
+        # 虞劲枫(35)：绝地反击
+        if target == 35 and (not self.roles[35].status.perma_disabled):
+            mem = self.roles[35].mem.setdefault("yjf_hits", {})  # source->count
+            key = str(source)
+            mem[key] = int(mem.get(key, 0)) + 1
+            cnt = mem[key]
+            if cnt >= 2 and source in self.roles and self.roles[source].alive:
+                self._log(f"  · 绝地反击：{self.N(35)} 第二次被 {self.N(source)} 选中 → 反击淘汰 {self.N(source)}")
+                # 反击为技能淘汰（source=35），绕过护盾/复活
+                self.kill(source, 35, "绝地反击反杀", bypass_shield=True, bypass_revive=True)
+            else:
+                self._log(f"  · 绝地反击：{self.N(35)} 被 {self.N(source)} 选中 → 免疫（第{cnt}次）")
+            return False
+
+        return True
+
+    def set_status(self, target: int, attr: str, value, source: Optional[int], note: str = "") -> bool:
+        """对某个状态字段做写入：走统一选中入口 + 状态变化钩子。"""
+        if not self.apply_selection(source, target, note or f"状态:{attr}"):
+            return False
+        before = self.roles[target].status.brief()
+        setattr(self.roles[target].status, attr, value)
+        self._on_status_change(target, before)
+        return True
 
 
+    def _scj_status_types(self) -> set:
+        """沈澄婕(33) 当前拥有的状态“类型集合”（不含层数/剩余回合数）。"""
+        if 33 not in self.roles:
+            return set()
+        st = self.roles[33].status
+        types = set()
+        if st.thunder > 0:
+            types.add("雷霆")
+        if st.corrupted:
+            types.add("腐化")
+        if st.shields > 0:
+            types.add("护盾")
+        if st.sealed > 0:
+            types.add("封印")
+        if st.forgotten > 0:
+            types.add("遗忘")
+        if st.dusk_mark > 0:
+            types.add("暮印")
+        if st.focused:
+            types.add("集火")
+        if getattr(st, "invisible", False):
+            types.add("隐身")
+        if getattr(st, "fish", False):
+            types.add("鱼")
+        if getattr(st, "dying_ttl", 0) > 0:
+            types.add("濒亡")
+        if getattr(st, "attached_life", False):
+            types.add("附生")
+        if getattr(st, "lone_wolf", False):
+            types.add("孤军奋战")
+        if getattr(st, "juexi_ttl", 0) > 0:
+            types.add("绝息")
+        # 特异免疫本身也算一种状态；记录它并不会再触发自己（避免循环）
+        if getattr(st, "spec_immune_ttl", 0) > 0:
+            types.add("特异性免疫")
+        return types
+
+    def _scj_sync_and_grant(self):
+        """确保：沈澄婕每次获得一个“之前未记录过的存活玩家”，就会补一个层数（顶到 3）。
+        实现为：维护 status.scj_recorded_alive = set()，每次对比当前存活集合增量。
+        """
+        cid = 33
+        if cid not in self.roles:
+            return
+        if (not self.roles[cid].alive) or self.roles[cid].status.perma_disabled:
+            return
+
+        st = self.roles[cid].status
+        alive_now = set(self.alive_ids())
+        if st.scj_recorded_alive is None:
+            st.scj_recorded_alive = set()
+
+        newly = alive_now - st.scj_recorded_alive
+        if newly:
+            st.scj_recorded_alive |= newly
+            before = st.scj_layers
+            st.scj_layers = min(3, st.scj_layers + len(newly))
+            if st.scj_layers != before:
+                self._log(f"  · 【沈澄婕】记录到新存活者 {len(newly)} 名，层数 {before}→{st.scj_layers}")
+
+    # ---------- 双生 ----------
     # ---------- 双生 ----------
     def twin_partner(self, cid: int) -> Optional[int]:
         a, b = self.twin_pair
-        # 未绑定：b == -1
         if b == -1:
             return None
         if cid == a:
@@ -318,106 +629,100 @@ class Engine:
         if cid == b:
             return a
         return None
-
-    def twin_prob(self, cid: int) -> float:
-        # 基础 75%；钟无艳孤傲：双生传导概率降至25%
-        partner = self.twin_partner(cid)
-        if partner is None:
-            return 0.0
-        if cid == 21 or partner == 21:
-            return 0.25
-        return 0.75
-
     def twin_share_nonkill(self, cid: int, kind: str):
-        """
-        双生：当一方受到技能影响（护盾/交换/位移/封印/遗忘等）时，另一方概率复制“部分效果”
-        """
         partner = self.twin_partner(cid)
-        if partner is None:
-            return
-        if partner not in self.roles:
+        if partner is None or partner not in self.roles:
             return
         if not self.roles[partner].alive:
             return
-
-        p = self.twin_prob(cid)
-        if self.rng.random() > p:
+        if self.rng.random() > 0.75:
             self._log(f"  · 双生传导失败：{self.N(cid)} 未影响 {self.N(partner)}")
             return
-
         self._log(f"  · 双生传导成功：{self.N(cid)} → {self.N(partner)}（{kind}）")
-
         if kind == "gain_shield":
             self.give_shield(partner, 1, ttl=1, perm=False, note="双生复制护盾")
         elif kind in ("swap", "move"):
             d = self.rng.choice([-1, +1])
-            self.move_by(partner, d, note="双生±1位移")
+            self.move_by(partner, d, source=None, note="双生±1位移")
         elif kind == "seal":
             self.roles[partner].status.sealed = max(self.roles[partner].status.sealed, 1)
         elif kind == "forget":
             self.roles[partner].status.forgotten = max(self.roles[partner].status.forgotten, 1)
-
     def on_twin_death(self, dead: int):
         partner = self.twin_partner(dead)
-        # 未绑定 or 不存在：直接跳过
-        if partner is None:
-            return
-        if partner not in self.roles:
+        if partner is None or partner not in self.roles:
             return
         if self.roles[partner].alive:
             self._log(f"  · 双生死亡反馈：{self.N(partner)} 获得护盾1层")
             self.give_shield(partner, 1, ttl=1, perm=False, note="双生死亡反馈")
-
-
     # ---------- 排名操作 ----------
-    def swap(self, a: int, b: int, note: str = ""):
+    def swap(self, a: int, b: int, source: Optional[int] = None, note: str = ""):
         if not (self.roles[a].alive and self.roles[b].alive):
             return
-
-        # 潘乐一(2) 被动【大风机关】：免疫霜冻携带者对其施加的交换效果
-        if a == 2 and self.roles[b].status.frost:
-            self._log(f"  · 大风机关：{self.N(2)} 免疫来自 {self.N(b)} 的交换效果")
+        if self._juexi_blocks(source, a, "交换"):
             return
-        if b == 2 and self.roles[a].status.frost:
-            self._log(f"  · 大风机关：{self.N(2)} 免疫来自 {self.N(a)} 的交换效果")
+        if self._juexi_blocks(source, b, "交换"):
             return
-
+        if not self.apply_selection(source, a, "交换"):
+            return
+        if not self.apply_selection(source, b, "交换"):
+            return
         pa, pb = self.pos(a), self.pos(b)
         if pa is None or pb is None:
             return
         self.rank[pa], self.rank[pb] = self.rank[pb], self.rank[pa]
         self._log(f"  · 交换：{self.N(a)} ⇄ {self.N(b)}" + (f"（{note}）" if note else ""))
-        # 双生传导（交换属于技能影响）
-        self.twin_share_nonkill(a, "swap")
-
-    def move_by(self, cid: int, delta: int, note: str = ""):
-        """
-        delta<0 上升（更靠前），delta>0 下降
-        翻倍规则：若该角色带 doubled_move_next，且本次属于“排名变动效果”，则翻倍一次并清除标记。
-        """
+        self._check_shenwei_loss()
+    def move_by(self, cid: int, delta: int, source: Optional[int] = None, note: str = ""):
         if not self.roles[cid].alive:
+            return
+        if self._juexi_blocks(source, cid, "位移"):
+            return
+        # 防线：抵消首次下降类位移
+        st = self.roles[cid].status
+        if source == 29 and cid != 29:
+            self.roles[29].mem["did_displace"] = True
+        if delta > 0 and getattr(st, "defense_line_ttl", 0) > 0 and (not getattr(st, "defense_line_block", False)):
+            st.defense_line_block = True
+            self._log(f"  · 防线：{self.N(cid)} 抵消一次下降位移")
+            return
+        if not self.apply_selection(source, cid, "位移"):
             return
         p = self.pos(cid)
         if p is None:
             return
-
-        # 厄运翻倍只影响“排名变动效果数值”，工程化：move_by 一律视为排名变动效果
         st = self.roles[cid].status
         if st.doubled_move_next:
             delta *= 2
             st.doubled_move_next = False
             self._log(f"  · 厄运翻倍生效：{self.N(cid)} 本次位移数值翻倍")
-
         newp = max(0, min(len(self.rank) - 1, p + delta))
         if newp == p:
             return
         self.rank.pop(p)
         self.rank.insert(newp, cid)
         self._log(f"  · 位移：{self.N(cid)} {p+1}→{newp+1}" + (f"（{note}）" if note else ""))
-        self.twin_share_nonkill(cid, "move")
+        self._check_shenwei_loss()
+    def move_to_first(self, cid: int, source: Optional[int] = None, note: str = ""):
+        """Move character to rank #1 (top) if alive and present in rank list."""
+        if (cid not in self.rank) or (not self.roles[cid].alive):
+            return
+        cur = self.rank.index(cid)
+        if cur == 0:
+            return
+        self.rank.pop(cur)
+        self.rank.insert(0, cid)
+        if note:
+            self._log(f"  · 位移：{self.N(cid)} → 第1名（{note}）")
+        else:
+            self._log(f"  · 位移：{self.N(cid)} → 第1名")
 
-    def insert_rank(self, cid: int, new_rank: int, note: str = ""):
+    def insert_rank(self, cid: int, new_rank: int, source: Optional[int] = None, note: str = ""):
         if not self.roles[cid].alive:
+            return
+        if self._juexi_blocks(source, cid, "插入"):
+            return
+        if not self.apply_selection(source, cid, "插入"):
             return
         p = self.pos(cid)
         if p is None:
@@ -426,8 +731,8 @@ class Engine:
         self.rank.pop(p)
         self.rank.insert(new_rank - 1, cid)
         self._log(f"  · 插入：{self.N(cid)} → 第{new_rank}名" + (f"（{note}）" if note else ""))
-
     # ---------- mls 被动 ----------
+        self._check_shenwei_loss()
     def mls_try_immune(self, cid: int, effect_desc: str) -> bool:
         if cid != 10:
             return False
@@ -442,139 +747,291 @@ class Engine:
         st.mls_immune_used_this_turn = True
         st.mls_immune_used += 1
         self._log(f"  · mls(10) 绝对领域：免疫一次技能影响（{effect_desc}）并排名+1（已用{st.mls_immune_used}/3）")
-        self.move_by(10, -1, note="绝对领域+1")
+        self.move_by(10, -1, source=None, note="绝对领域+1")
         return True
-
     def is_mls_unselectable_by_active_kill(self, target: int) -> bool:
-        # mls 绝对防御：无法被角色的主动斩杀选中（但可被世界规则处决）
         return target == 10
-
-    # ---------- 众议院挡刀 ----------
-    def find_guarder_for(self, victim: int) -> Optional[int]:
-        for cid in self.alive_ids():
-            st = self.roles[cid].status
-            if st.guard_for == victim and not st.guard_used:
-                return cid
-        return None
-
-    # ---------- 击杀 / 死亡 ----------
-    def kill(self, victim, killer, reason,
-         bypass_shield=False,
-         bypass_guard=False,
-         bypass_revive=False):
-        """
-        统一死亡入口：处理挡刀、护盾、左右脑复活、郑孑健护盾消耗触发、记录死亡顺序、双生死亡反馈等
-        """
-        if not self.roles[victim].alive:
+    # ---------- 击杀/死亡 ----------
+    def kill(self, victim: int, killer: Optional[int], reason: str,
+             bypass_shield: bool = False,
+             bypass_revive: bool = False):
+        if victim not in self.roles or not self.roles[victim].alive:
+            return False
+        # Joke mode: 找自称(25) is invincible (immune to everything, including world rules)
+        if self.joke_mode and victim == 25:
+            self._log("  · 找自称(25) 无敌：免疫本次淘汰")
+            return False
+        # 沈澄婕(33)：特异性免疫期间无敌（包含世界规则伤害），但不免疫终局末位淘汰
+        if victim == 33 and self.roles[33].status.spec_immune_ttl > 0 and ("终局末位淘汰" not in reason):
+            self._log(f"  · 特异性免疫：{self.N(33)} 免疫死亡（{reason}）")
+            return False
+        if self._juexi_blocks(killer, victim, reason):
             return False
 
-        # 潘乐一(2) 被动【大风机关】：免疫霜冻携带者对其施加的效果
-        if self.frost_immune(killer, victim, reason):
+        if not self.apply_selection(killer, victim, reason):
             return False
 
+        # 书法家(9)【死而复生·遗策】：当自己被淘汰时立刻复活，
+        # 获得永久【遗策】(perma_disabled=True)，并插至第一名；每局仅触发一次。
+        if victim == 9 and (not bypass_revive):
+            r9 = self.roles[9]
+            if (not r9.status.perma_disabled) and (not r9.mem.get("shufa_revive_used", False)):
+                r9.mem["shufa_revive_used"] = True
+                # 立刻“复活”：本次淘汰无效化
+                r9.alive = True
+                r9.status.perma_disabled = True  # 永久遗策
+                # 清理容易导致连锁的问题状态（保守：清雷霆与濒亡）
+                r9.status.thunder = 0
+                if hasattr(r9.status, "dying_ttl"):
+                    r9.status.dying_ttl = 0
+                # 插到第一名
+                self._log("  · 书法家(9) 死而复生：复活并获得永久【遗策】，直插第1名（本局一次）")
+                self.insert_rank(9, 1, source=None, note="书法家复活直插第一")
+                return False
 
-        # 挡刀
-        if not bypass_guard:
-            guarder = self.find_guarder_for(victim)
-            if guarder is not None and guarder != victim:
-                self.roles[guarder].status.guard_used = True
-                self._log(f"  · 挡刀触发：{self.N(guarder)} 为 {self.N(victim)} 挡刀")
-                # 挡刀者承受同一次死亡（通常也可被护盾）
-                self.kill(guarder, killer, reason=f"挡刀代死（原目标{self.N(victim)}）", bypass_shield=bypass_shield, bypass_guard=True)
+
+        # 俞守衡(42) 鱼珠回魂：每局一次，被淘汰时改为进入濒亡3回合（濒亡期间不能行动）；不免疫世界规则
+        if victim == 42 and killer is not None and (not bypass_revive) and (not self.roles[42].status.perma_disabled):
+            if not self.roles[42].mem.get("fish_soul_used", False):
+                self.roles[42].mem["fish_soul_used"] = True
+                before42 = self.roles[42].status.brief()
+                self.roles[42].status.dying_ttl = 3
+                self._log("  · 鱼珠回魂：俞守衡(42) 进入【濒亡】3回合（本局一次）")
+                self._on_status_change(42, before42)
                 return False
 
         # 护盾
         if not bypass_shield and self.roles[victim].status.total_shields() > 0:
             self.consume_shield_once(victim)
             self._log(f"  · 护盾抵死：{self.N(victim)}（{reason}）")
-            # 郑孑健：每消耗一层护盾随机斩杀一人
-            if victim == 14 and not self.roles[14].status.perma_disabled:
-                self._log("  · 郑孑健(14) 坚韧之魂：消耗护盾后随机斩杀1人")
-                pool = [x for x in self.alive_ids() if x != 14]
-                if pool:
-                    t = self.rng.choice(pool)
-                    self.kill(t, 14, "坚韧之魂随机斩杀")
+            if "雷霆" in str(reason) and self.roles[victim].status.thunder >= 3:
+                self.roles[victim].status.thunder = 0
+                self._log(f"  · 雷霆清除：{self.N(victim)} 因护盾抵消雷霆致死，雷霆归零")
+            # 变更：删除郑孑健“坚毅之魂”——这里不再触发任何护盾消耗斩杀
             return False
-
-        # 左右脑复活（可被强制处决绕过）
-        if (not bypass_revive) and victim == 24 and not self.roles[24].status.perma_disabled:
+        # 左右脑复活
+        if (not bypass_revive) and victim == 24 and (not self.roles[24].status.perma_disabled):
             st = self.roles[24].status
             if st.revives_left > 0:
                 st.revives_left -= 1
                 self._log(f"  · 左右脑(24) 双重生命：立即复活（剩余{st.revives_left}）")
+                if self.roles[victim].status.thunder >= 3:
+                    self.roles[victim].status.thunder = 0
+                    self._log(f"  · 雷霆清除：{self.N(victim)} 复活后雷霆归零")
                 return False
+        # 严雅(29) 复活直升第一机制已移除
 
 
         # 真死亡
         self.roles[victim].alive = False
-        self.roles[victim].mem["dead_turn"] = self.turn   # ✅补：立刻记录死亡回合
+        self.roles[victim].status.thunder = 0
+        self.roles[victim].mem["dead_turn"] = self.turn
         self.deaths_this_turn.append(DeathRecord(victim, killer, reason))
-        # 找自称(25)：每有角色被击败，获得1层祝福；祝福满10层兑换1护盾并清空祝福
-        if victim != 25 and self.roles[25].alive and not self.roles[25].status.perma_disabled:
+        # 30 陈心如：回声追索（本回合发生淘汰则标记一名高于自己的角色迂回2回合）
+        if self.roles.get(30) and self.roles[30].alive and (not self.roles[30].status.perma_disabled):
+            if int(self.roles[30].mem.get("detour_turn", -1)) != self.turn:
+                self.roles[30].mem["detour_turn"] = self.turn
+                r30 = self.rank_no(30)
+                if r30 is not None:
+                    cand = []
+                    for x in self.alive_ids():
+                        if x == 30:
+                            continue
+                        rx = self.rank_no(x)
+                        if rx is not None and rx < r30:
+                            cand.append(x)
+                    if cand:
+                        t = self.rng.choice(cand)
+                        self.roles[t].status.detour_ttl = max(getattr(self.roles[t].status, "detour_ttl", 0), 2)
+                        self._log(f"  · 回声追索：{self.N(30)} 使 {self.N(t)} 获得【迂回】(2回合)")
+
+        # 37 真相解码：若存在目击时自己被淘汰，则连带凶手一起被淘汰
+        if victim == 37:
+            st37 = self.roles[37].status
+            if getattr(st37, "witness", False) and killer is not None and self.roles.get(killer) and self.roles[killer].alive:
+                self._log(f"  · 真相解码：{self.N(37)} 持有目击被淘汰 → 连带淘汰凶手 {self.N(killer)}")
+                self.kill(killer, 37, "真相解码连坐", bypass_shield=True)
+
+        # 37 破绽洞察：监听低于自己排名的来源淘汰
+        if killer is not None and victim != killer and self.roles.get(37) and self.roles[37].alive and (not self.roles[37].status.perma_disabled):
+            sr = self.rank_no(37)
+            vr = self.rank_no(victim)
+            if sr is not None and vr is not None and vr > sr:
+                st37 = self.roles[37].status
+                if not getattr(st37, "witness", False):
+                    if int(self.roles[37].mem.get("witness_block_turn", -1)) != self.turn:
+                        st37.witness = True
+                        self._log(f"  · 破绽洞察：{self.N(37)} 获得【目击】")
+                else:
+                    st37.witness = False
+                    self.roles[37].mem["witness_block_turn"] = self.turn
+                    kr = self.rank_no(killer)
+                    self._log(f"  · 破绽洞察：{self.N(37)} 目击触发 → 反制淘汰凶手 {self.N(killer)}")
+                    killed = self.kill(killer, 37, "破绽洞察反制", bypass_shield=True)
+                    if killed and kr is not None and sr is not None:
+                        diff = abs(sr - kr)
+                        if diff > 0:
+                            self._log(f"  · 破绽洞察：上升差值 {diff} 名")
+                            self.move_by(37, -diff, source=37, note="破绽洞察位移")
+
+        # 43 救赎祷言：相邻二人被淘汰后复活（场上剩余>=4）
+        if killer is not None and self.roles.get(43) and self.roles[43].alive and (not self.roles[43].status.perma_disabled):
+            alive_cnt = len(self.alive_ids())
+            if alive_cnt >= 4:
+                p43 = self.pos(43)
+                if p43 is not None:
+                    revived = []
+                    for dp in (-1, 1):
+                        q = p43 + dp
+                        if 0 <= q < len(self.rank):
+                            neigh = self.rank[q]
+                            if neigh == victim and (not self.roles[neigh].alive):
+                                self.roles[neigh].alive = True
+                                self.roles[neigh].status.dying_ttl = 0
+                                revived.append(neigh)
+                    if revived:
+                        self.roles[43].status.defense_ttl = max(getattr(self.roles[43].status, "defense_ttl", 0), 3)
+                        for x in revived:
+                            self.roles[x].status.defense_ttl = max(getattr(self.roles[x].status, "defense_ttl", 0), 3)
+                        self._log(f"  · 救赎祷言：{self.N(43)} 复活相邻被淘汰者 " + "、".join(self.N(x) for x in revived) + " 并授予【辩护】(3回合)")
+
+        self.elimination_order.append(victim)
+        self.elimination_turn[victim] = self.turn
+
+        # 随机事件NPC被淘汰：给予淘汰者特殊状态
+        if victim == getattr(self, "HW_CID", 1001):
+            if killer is not None and killer in self.roles and self.roles[killer].alive:
+                before_k = self.roles[killer].status.brief()
+                self.roles[killer].status.hongwei_gift_shield = 1
+                self._log(f"  · 洪伟陨落：{self.N(killer)} 获得【洪伟之赐】（抵挡一次伤害；每回合上升2名）")
+                self._on_status_change(killer, before_k)
+        if victim == getattr(self, "LDL_CID", 1002):
+            if killer is not None and killer in self.roles and self.roles[killer].alive:
+                before_k = self.roles[killer].status.brief()
+                self.roles[killer].status.thunder_wrist_shield = 1
+                self._log(f"  · 李东雷陨落：{self.N(killer)} 获得【雷霆手腕】（抵挡一次伤害；每回合给上一名+1雷霆）")
+                self._on_status_change(killer, before_k)
+        self.check_qiyinlu_lone_wolf()
+
+        # 李知雨(31) 改动：若被【世界规则处决】淘汰，则随机给一名存活者施加【附生】（每局一次）。
+        if victim == 31 and killer is None and (not bypass_revive) and (reason == "世界规则处决"):
+            if not self.roles[31].mem.get("candle_used", False):
+                self.roles[31].mem["candle_used"] = True
+                candidates = [c for c in self.alive_ids()
+                              if c != 31 and c not in (getattr(self, "HW_CID", 1001), getattr(self, "LDL_CID", 1002))]
+                if candidates:
+                    t = self.rng.choice(candidates)
+                    before_t = self.roles[t].status.brief()
+                    self.roles[t].status.attached_life = True
+                    self.roles[t].mem["attached_life_of"] = 31
+                    self._log(f"  · 残灯复明：世界规则淘汰李知雨(31) → 随机使 {self.N(t)} 获得【附生】")
+                    self._on_status_change(t, before_t)
+                else:
+                    self._log("  · 残灯复明：但无人可获得【附生】")
+        # 李知雨(31) 残灯复明：被淘汰时给淘汰者附生；附生者再死则31复活顶替（每局一次）
+        if victim == 31:
+            if not self.roles[31].mem.get("candle_used", False):
+                self.roles[31].mem["candle_used"] = True
+                if killer is not None and killer in self.roles and self.roles[killer].alive:
+                    uses = int(self.roles[31].mem.get("attached_uses", 0)) if 31 in self.roles else 0
+                    if uses >= 2:
+                        self._log("  · 残灯复明：本局附生已触发2次 → 不再给予【附生】")
+                    else:
+                        before_k = self.roles[killer].status.brief()
+                        self.roles[killer].status.attached_life = True
+                        self.roles[killer].mem["attached_life_of"] = 31
+                        if 31 in self.roles:
+                            self.roles[31].mem["attached_uses"] = uses + 1
+                        self._log(f"  · 残灯复明：{self.N(killer)} 获得【附生】")
+                        self._on_status_change(killer, before_k)
+
+        # 附生触发：附生者被淘汰 → 李知雨(31) 立刻复活并顶替其位置
+        if self.roles[victim].status.attached_life and self.roles[victim].mem.get("attached_life_of") == 31:
+            if 31 in self.roles and (not self.roles[31].alive):
+                pos = self.pos(victim)
+                self.roles[31].alive = True
+                self.roles[31].status.thunder = 0
+                # 清除鱼/封印/遗忘等负面可按需保留，这里仅清雷霆
+                if pos is None:
+                    self.rank.append(31)
+                else:
+                    self.rank = [cid for cid in self.rank if cid != 31]
+                    self.rank.insert(pos, 31)
+                self._compact()
+                self._log(f"  · 残灯复明：附生者 {self.N(victim)} 被淘汰 → 李知雨(31) 复活并顶替其位置")
+        # 找自称：祝福叠加/兑换护盾
+        if victim != 25 and (25 in self.roles) and self.roles[25].alive and (not self.roles[25].status.perma_disabled):
             st25 = self.roles[25].status
-            st25.blessing += 1
-            self._log(f"  · 找自称(25) 获得祝福+1（现为{st25.blessing}层）")
-
-            if st25.blessing >= 10:
-                self._log("  · 找自称(25) 祝福叠满10层：兑换1层护盾，并清空祝福")
+            st25.mem_bless = st25.__dict__.get("mem_bless", 0)  # 兼容：不新增字段也能用
+            st25.mem_bless += 1
+            st25.__dict__["mem_bless"] = st25.mem_bless
+            self._log(f"  · 找自称(25) 获得祝福+1（现为{st25.mem_bless}层）")
+            if st25.mem_bless >= 8:
+                self._log("  · 找自称(25) 祝福叠满8层：兑换1层护盾，并清空祝福")
                 self.give_shield(25, 1, ttl=1, perm=False, note="祝福兑换护盾")
-                st25.blessing = 0
-        if killer is None:
-            self._log(f"  · 【死亡】{self.N(victim)}（{reason}）")
-        else:
-            self._log(f"  · 【击杀】{self.N(killer)} → {self.N(victim)}（{reason}）")
-        # Sunny(26) 新规则：若被他人击败，则击败者获得【天命使然】→ 腐化
-        if victim == 26 and killer is not None and killer in self.roles and self.roles[killer].alive:
-            if not self.roles[killer].status.corrupted:
-                self.roles[killer].status.corrupted = True
-                self._log(f"  · 【天命使然】{self.N(killer)} 获得腐化")
+                st25.__dict__["mem_bless"] = 0
 
-
-        # 双生：一方死亡另一方得盾
-        self.on_twin_death(victim)
+        # Sunny死亡：仅第一次被淘汰时，击败者获得腐化；第二次被淘汰不再赋予腐化
+        if victim == 26:
+            dt = self.roles[26].mem.get("death_times", 0) + 1
+            self.roles[26].mem["death_times"] = dt
+            if dt == 1 and killer is not None and killer in self.roles and self.roles[killer].alive:
+                if not self.roles[killer].status.corrupted:
+                    self.roles[killer].status.corrupted = True
+                    self._log(f"  · 【天命使然】{self.N(killer)} 获得腐化")
         return True
-
     # =========================
     # 新开局 / 回合推进
     # =========================
-
     def new_game(self):
+        # 清理随机事件NPC（避免上一局残留）
+        for _npc in (getattr(self, 'HW_CID', 1001), getattr(self, 'LDL_CID', 1002)):
+            if _npc in getattr(self, 'roles', {}):
+                try:
+                    del self.roles[_npc]
+                except Exception:
+                    pass
+        try:
+            self.rank = [cid for cid in getattr(self, 'rank', []) if cid not in (getattr(self, 'HW_CID', 1001), getattr(self, 'LDL_CID', 1002))]
+        except Exception:
+            pass
+        try:
+            self.skill_order = [cid for cid in getattr(self, 'skill_order', []) if cid not in (getattr(self, 'HW_CID', 1001), getattr(self, 'LDL_CID', 1002))]
+        except Exception:
+            pass
         self.turn = 0
+        self.world_event_triggered_this_turn = False  # 本回合是否触发世界事件
+        # RNG reset policy:
+        # - If base_seed is None: reseed from system entropy so each new game is independent/random.
+        # - If base_seed is set: keep deterministic across new_game for reproducible testing.
+        if self.base_seed is None:
+            self.rng = random.Random()
+        else:
+            self.rng = random.Random(self.base_seed)
         self.game_over = False
         self.no_death_streak = 0
+        self.pending_endgame_execute = False
         self.log = []
+        self.replay_frames = []
         self.deaths_this_turn = []
-
-        # reset
+        self.elimination_order = []
         for r in self.roles.values():
             r.alive = True
             r.status = Status()
             r.mem = {}
-
-        # 钟无艳孤傲标签
-        self.roles[21].status.lonely_pride = True
-
         # 初始排名随机
         self.rank = list(self.roles.keys())
         self.rng.shuffle(self.rank)
-
-        # 双生：藕禄(13) 随机绑定
+        # 每局随机生成一次“技能发动顺序”，之后每回合按此顺序循环（仅对存活且有主动技能者生效）
+        self.skill_order = self.rank[:]  # 以初始排名的随机结果作为基础，再打乱一次更独立
+        self.rng.shuffle(self.skill_order)
+        # 双生：藕禄(13) 随机绑定（发动时绑定一次）
         self.twin_pair = (13, -1)
-
         self._log("【新开局】已生成初始排名")
-
     def spread_corruption_and_check(self):
-        """
-        腐化机制：
-        - 拥有腐化的角色，每回合把腐化传染给自己排名相邻的两人（左右各一）
-        - 当所有存活角色都拥有腐化时：清除所有腐化，然后触发【无中生有】：
-          Sunny(26) 若死亡且本局未触发过，则随机位置复活一次。
-        """
         alive = self.alive_ids()
         if not alive:
             return
-
-        # 1) 本回合腐化扩散（同时结算，避免链式一回合扩全场）
         sources = [cid for cid in alive if self.roles[cid].status.corrupted]
         if sources:
             to_infect = set()
@@ -586,117 +1043,154 @@ class Engine:
                     to_infect.add(self.rank[p - 1])
                 if p + 1 < len(self.rank):
                     to_infect.add(self.rank[p + 1])
-
             newly = [x for x in to_infect if self.roles[x].alive and (not self.roles[x].status.corrupted)]
             for x in newly:
+                before_x = self.roles[x].status.brief()
                 self.roles[x].status.corrupted = True
+                self._oulu_bump_on_status_change(x, before_x)
             if newly:
                 self._log("【腐化】扩散：" + "、".join(self.N(x) for x in newly))
-
-        # 2) 检查是否“全场存活者都腐化”
         alive = self.alive_ids()
         if alive and all(self.roles[cid].status.corrupted for cid in alive):
             self._log("【腐化】全场腐化达成：清除所有腐化效果")
             for cid in self.roles:
+                before_c = self.roles[cid].status.brief()
                 self.roles[cid].status.corrupted = False
-
-            # 触发【无中生有】（每局一次）
+                self._oulu_bump_on_status_change(cid, before_c)
             st26 = self.roles[26].status
-            if (not st26.sunny_revive_used):
+            if not st26.sunny_revive_used:
                 st26.sunny_revive_used = True
                 if not self.roles[26].alive:
                     self.roles[26].alive = True
-                    # 随机位置插入（1..len(rank)+1）
+                    if st26.thunder >= 3:
+                        st26.thunder = 0
+                        self._log("  · 雷霆清除：Sunny 复活后雷霆归零")
                     self._compact()
-                    pos = self.rng.randint(1, len(self.rank) + 1)
-                    self.rank.insert(pos - 1, 26)
+                    pos = 1
+                    self.rank.insert(0, 26)
                     self._compact()
-                    self._log(f"【无中生有】Sunnydayorange(26) 复活于随机位置：第{pos}名")
+                    self._log("【无中生有】Sunnydayorange(26) 复活于第1名")
                 else:
                     self._log("【无中生有】本应复活，但 Sunny 已存活 → 仅记录触发（每局一次）")
-
     def next_turn(self):
-        if getattr(self, "game_over", False):
+        if self.game_over:
             self._log("【提示】本局已结束，请点击【新开局】重新开始。")
             return
         self.turn += 1
+        self._active_logged.clear()
+        self.world_event_triggered_this_turn = False
+        # reset per-turn markers
+        for _cid, _r in self.roles.items():
+            _r.status.spec_immune_gained_this_turn = False
+        if self.roles.get(29):
+            self.roles[29].mem["did_kill"] = False
+            self.roles[29].mem["did_displace"] = False
+        
+        # store start-of-turn ranks
+        for _cid in self.alive_ids():
+            self.roles[_cid].mem["start_rank"] = self.rank_no(_cid)
+        # store start-of-turn status signature for 严雅(29) excluding 静默
+        if self.roles.get(28) and self.roles[28].alive:
+            self.roles[29].mem["start_status_no_silent"] = self._status_sig_no_silent(28)
         self.replay_frames = []
-        self.replay_turn_id += 1
         self._log("")
         self._log(f"========== 【第{self.turn}回合开始】 ==========")
-
-        # 回合开始：记录起始排名，用于钟无艳回合末判定“上升≥2”
         self.start_rank_snapshot = {cid: self.rank_no(cid) for cid in self.alive_ids()}
 
-        # 回合开始清理：mls 每回合免疫标记
-        for cid in self.alive_ids():
-            self.roles[cid].status.mls_immune_used_this_turn = False
-            self.roles[cid].status.focused = False
-            self.roles[cid].status.guard_for = None
-            self.roles[cid].status.guard_used = False
-            self.roles[cid].mem["judged_this_turn"] = False
 
-        # hewenx怨念爆发：在“下回合行动前”结算
-        self.apply_hewenx_curse_preaction()
-
-        # 本回合死亡清空
-        self.deaths_this_turn = []
-
-        # 1 世界规则
-        self.step_world_rule()
-
-        # 2 主动技能
-        self.step_active_skills()
-
-        # 3 死亡触发
-        self.step_death_triggers()
-        
-        # 4 更新状态
-        self.step_update_and_cleanup()
-
-        # ✅ 先更新连续无人死亡计数
-        if len(self.deaths_this_turn) == 0:
-            self.no_death_streak += 1
-        else:
-            self.no_death_streak = 0
-
-        # ✅ 再判断补刀
-        self.step_world_bonus()
-
-        self._log(f"========== 【第{self.turn}回合结束】 存活{len(self.alive_ids())}人；连续无人死亡={self.no_death_streak} ==========")
-        # ★ 终局兜底：防止僵死
-        alive = self.alive_ids()
-        if len(alive) <= 3 and self.no_death_streak >= 2:
-            target = alive[-1]
-            self._log(f"【终局补刀】强制处决末位 {self.N(target)}（防止僵死）")
-            self.kill(target, None, "终局强制补刀", bypass_shield=True)
+        # 0. 施禹谦(36) 神威：为第一名时，每回合处决末位；否则立刻消失
+        if 36 in self.roles and self.roles[36].alive and (not self.roles[36].status.perma_disabled):
+            st36 = self.roles[36].status
+            if st36.shenwei:
+                if self.rank_no(36) != 1:
+                    self._check_shenwei_loss()
+                else:
+                    alive_now2 = self.alive_ids()
+                    if len(alive_now2) >= 2:
+                        target = alive_now2[-1]
+                        if target != 36:
+                            self._log(f"【神威】处决末位：{self.N(target)}（可被护盾抵消）")
+                            self.kill(target, 36, "神威处决", bypass_shield=False, bypass_revive=False)
+                            self.step_death_triggers()
+                            self._compact()
+        # 回合开始：末位斩杀待执行
+        alive_now = self.alive_ids()
+        if self.pending_endgame_execute and alive_now and len(alive_now) <= 3:
+            target = alive_now[-1]
+            self._log(f"【末位斩杀】执行：斩杀末位 {self.N(target)}（可被护盾抵消）")
+            self.kill(target, None, "末位斩杀", bypass_shield=False, bypass_revive=False)
             self.step_death_triggers()
             self._compact()
-        # ---------- 胜利判定 ----------
+            self.pending_endgame_execute = False
+        # 回合开始清理
+        for cid in self.alive_ids():
+            self.roles[cid].status.mls_immune_used_this_turn = False
+        # hewenx怨念爆发：下回合行动前结算
+        self.apply_hewenx_curse_preaction()
+        self.deaths_this_turn = []
+        # 1 世界规则（第1回合不触发）
+        if self.turn == 1:
+            self._log("【世界规则】第1回合不触发")
+        else:
+            self.step_world_rule()
+        # 1.5 随机事件（世界规则后、角色技能前）
+        self._random_event_trigger()
+        # 1.6 随机事件NPC自动施法（世界规则后）
+        self.step_event_npc_actions()
+        # 2 主动技能
+        self.step_active_skills()
+        # 3 死亡触发
+        self.step_death_triggers()
+        # 4 更新与被动
+        self.step_update_and_cleanup()
+        # 连续无人死亡计数（仅终局≤3）
+        alive_after = self.alive_ids()
+        if len(alive_after) <= 3:
+            if len(self.deaths_this_turn) == 0:
+                self.no_death_streak += 1
+            else:
+                self.no_death_streak = 0
+        else:
+            self.no_death_streak = 0
+        self._log(f"========== 【第{self.turn}回合结束】 存活{len(self.alive_ids())}人；连续无人死亡={self.no_death_streak} ==========")
+        alive = self.alive_ids()
+        if not alive:
+            self.game_over = True
+            return
+        if len(alive) > 3:
+            self.pending_endgame_execute = False
+        else:
+            if (not self.pending_endgame_execute) and self.no_death_streak >= 3:
+                self.pending_endgame_execute = True
+                self._log("【末位斩杀】存活≤3且连续3回合无人淘汰：下一回合将斩杀末位（可被护盾抵消）")
+        # 胜利判定
         alive = self.alive_ids()
         if len(alive) == 1:
             winner = alive[0]
+            second = self.elimination_order[-1] if len(self.elimination_order) >= 1 else None
+            third = self.elimination_order[-2] if len(self.elimination_order) >= 2 else None
             self._log(f"🏆【胜利】{self.N(winner)} 活到最后，获得胜利！")
+            if second is not None:
+                self._log(f"🥈【第二名】{self.N(second)}")
+            if third is not None:
+                self._log(f"🥉【第三名】{self.N(third)}")
             self.game_over = True
-
     # =========================
     # 步骤1：世界规则
     # =========================
-
     def step_world_rule(self):
         alive = self.alive_ids()
         if len(alive) < 4:
             self._log("【世界规则】存活人数不足4，不触发")
             return
-
-        # =========================================================
-        # ① 先处决第4名（你要求：位于添加雷霆效果之前）
-        # =========================================================
+        # 世界事件开始
+        self.world_event_triggered_this_turn = True
+        # 沈澄婕(33)：若触发世界事件且有特异性免疫 -> 立刻插入第一
+        if self.roles.get(33) and self.roles[33].alive and getattr(self.roles[33].status, 'spec_immune_ttl', 0) > 0:
+            self._log(f"【沈澄婕】世界事件触发且有特异性免疫 → 立刻插入第一")
+            self.insert_rank(33, 1, note="沈澄婕-世界事件免疫")
         target4 = alive[3]
         self._log(f"【世界规则】处决第4名：{self.N(target4)}")
-
-
-        # 豆进天之父：豆进天死亡后，免疫一次世界处决（每局一次）
         if target4 == 20 and (not self.roles[11].alive) and (not self.roles[20].status.perma_disabled):
             st = self.roles[20].status
             if not st.father_world_immune_used:
@@ -706,92 +1200,297 @@ class Engine:
                 self.kill(target4, None, "世界规则处决", bypass_shield=False)
         else:
             self.kill(target4, None, "世界规则处决", bypass_shield=False)
-        # 豆父被动：世界规则处决时+1（最多3次）
-        # 注意：这里的“处决时”你原逻辑是无论处决谁，只要发生过处决就给豆父+1
         if (not self.roles[11].alive) and self.roles[20].alive and (not self.roles[20].status.perma_disabled):
             st = self.roles[20].status
             if st.father_world_boost_count < 3:
                 st.father_world_boost_count += 1
                 self._log("  · 豆进天之父：被动触发（世界规则处决时排名+1，计数+1）")
-                self.move_by(20, -1, note="父子同心(被动)+1")
-
-        # 处决可能造成死亡，先压缩一下
+                self.move_by(20, -1, source=None, note="父子同心(被动)+1")
         self._compact()
         alive = self.alive_ids()
         if not alive:
             return
-
-        # =========================================================
-        # ② 再结算雷霆（第5/6/7名获得雷霆层数，满3立刻死亡）
-        # =========================================================
-        thunder_targets = []
-        for idx in (4, 5, 6):  # 0-based: 第5/6/7名
+        thunder_targets: List[int] = []
+        for idx in (4, 5, 6):
             if idx < len(alive):
                 thunder_targets.append(alive[idx])
-
         if thunder_targets:
             self._log("【世界规则】雷霆降临：第5/6/7名获得一层雷霆")
             for t in thunder_targets:
                 if not self.roles[t].alive:
                     continue
                 st = self.roles[t].status
+                before_t = self.roles[t].status.brief()
                 st.thunder += 1
+                self._oulu_bump_on_status_change(t, before_t)
                 self._log(f"  · {self.N(t)} 雷霆层数={st.thunder}")
                 if st.thunder >= 3:
                     self._log(f"  · 雷霆满3：{self.N(t)} 立刻死亡")
-                    # “立刻死亡”无视护盾/挡刀
-                    self.kill(t, None, "雷霆叠满3层处决", bypass_shield=False, bypass_guard=True)
+                    self.kill(t, None, "雷霆叠满3层处决", bypass_shield=False, bypass_revive=True)
+        self._compact()
+    
+    # =========================
+    # 随机事件
+    # =========================
+    def _ensure_npc(self, cid: int, name: str):
+        """Create NPC role if missing and insert into current rank at a random position."""
+        if cid in self.roles:
+            self.roles[cid].alive = True
+            if cid not in self.rank:
+                pos = self.rng.randint(0, len(self.rank))
+                self.rank.insert(pos, cid)
+            return
+        self.roles[cid] = Role(cid, name, alive=True)
+        pos = self.rng.randint(0, len(self.rank))
+        self.rank.insert(pos, cid)
 
+    def _random_event_trigger(self):
+        """
+        随机事件触发（世界规则后、角色技能前）：
+        - 第1回合不触发
+        - 每回合 25% 概率触发
+        - 触发后等概率抽取 1 个事件并执行
+        - 日志输出金色行：触发随机事件：【事件名】！（简短描述）
+        """
+        if self.turn <= 1:
+            return
+        if self.rng.random() >= 0.25:
+            return
 
-        # 雷霆也可能造成死亡，最后再压缩一次
+        events = [
+            ("洪伟降临", self._ev_spawn_hw),
+            ("李东雷降临", self._ev_spawn_ldl),
+            ("冰封下的阳光", self._ev_ice_sun),
+            ("倒反天罡", self._ev_reverse_rank),
+            ("氧化还原反应", self._ev_redox),
+            ("骰子", self._ev_shuffle_rank),
+        ]
+        name, fn = self.rng.choice(events)
+        desc = fn() or ""
+        if desc:
+            self._log(f"触发随机事件：【{name}】！{desc}")
+        else:
+            self._log(f"触发随机事件：【{name}】！")
         self._compact()
 
+    def _ev_spawn_hw(self) -> str:
+        cid = getattr(self, "HW_CID", 1001)
+        self._ensure_npc(cid, "洪伟")
+        self.roles[cid].mem["npc_casts"] = 0
+        return "洪伟加入游戏，并将在接下来3回合（世界规则后）施放技能。"
 
-    # =========================
+    def _ev_spawn_ldl(self) -> str:
+        cid = getattr(self, "LDL_CID", 1002)
+        self._ensure_npc(cid, "李东雷")
+        self.roles[cid].mem["npc_casts"] = 0
+        return "李东雷加入游戏，并将在接下来3回合（世界规则后）施放技能。"
+
+    def _ev_ice_sun(self) -> str:
+        # 随机复活三名已阵亡角色（排除容易出bug的特例）
+        dead = []
+        for cid, r in self.roles.items():
+            if r.alive:
+                continue
+            if cid in (getattr(self, "HW_CID", 1001), getattr(self, "LDL_CID", 1002)):
+                continue
+            # Sunnydayorange 腐化时不复活
+            if cid == 26 and getattr(r.status, "corrupted", False):
+                continue
+            # 李知雨：避免“附生/残灯”等链式状态导致错位（保守：已触发残灯不复活）
+            if cid == 31 and r.mem.get("candle_used", False):
+                continue
+            dead.append(cid)
+
+        if not dead:
+            return "但无人可被复活。"
+
+        k = min(3, len(dead))
+        picks = self.rng.sample(dead, k=k)
+        for cid in picks:
+            # 从淘汰序列移除，避免结算名次异常
+            try:
+                self.elimination_order = [x for x in self.elimination_order if x != cid]
+            except Exception:
+                pass
+            self.roles[cid].alive = True
+            st = self.roles[cid].status
+            # 复活时清理部分容易连锁的即时状态（保守）
+            st.thunder = 0
+            if hasattr(st, "dying_ttl"):
+                st.dying_ttl = 0
+            # 插入到随机位置
+            if cid not in self.rank:
+                pos = self.rng.randint(0, len(self.rank))
+                self.rank.insert(pos, cid)
+
+        return "复活了 " + "、".join(self.N(c) for c in picks) + "。"
+
+    def _ev_reverse_rank(self) -> str:
+        self.rank = list(reversed(self.rank))
+        return "所有人排名完全颠倒。"
+
+    def _ev_redox(self) -> str:
+        alive = [cid for cid in self.alive_ids()
+                 if cid not in (getattr(self, "HW_CID", 1001), getattr(self, "LDL_CID", 1002))]
+        if not alive:
+            return "但场上无人受到影响。"
+
+        pool = alive[:]
+        self.rng.shuffle(pool)
+        oxid = pool[:2] if len(pool) >= 2 else pool[:]
+        rest = [c for c in pool if c not in oxid]
+        reduc = rest[:2] if len(rest) >= 2 else (rest[:] if rest else oxid[:2])
+
+        for cid in oxid:
+            before = self.roles[cid].status.brief()
+            self.roles[cid].status.oxid_ttl = max(getattr(self.roles[cid].status, "oxid_ttl", 0), 3)
+            self._on_status_change(cid, before)
+        for cid in reduc:
+            before = self.roles[cid].status.brief()
+            self.roles[cid].status.reduce_ttl = max(getattr(self.roles[cid].status, "reduce_ttl", 0), 3)
+            self._on_status_change(cid, before)
+
+        return f"{'、'.join(self.N(c) for c in oxid)} 获得【氧化】3回合；{'、'.join(self.N(c) for c in reduc)} 获得【还原】3回合。"
+
+    def _ev_shuffle_rank(self) -> str:
+        self.rng.shuffle(self.rank)
+        return "所有人排名被打乱。"
+
+    def step_event_npc_actions(self):
+        """
+        洪伟/李东雷：存在时，每回合在世界规则后施放一次技能（共3次），然后离场。
+        - 洪伟：随机插入到任意位置，并为相邻2人添加1层【永久护盾】
+        - 李东雷：随机插入到任意位置，并为相邻2人添加1层【雷霆】
+        """
+        # 洪伟
+        hw = getattr(self, "HW_CID", 1001)
+        if hw in self.roles and self.roles[hw].alive:
+            self._npc_cast_hw(hw)
+
+        # 李东雷
+        ldl = getattr(self, "LDL_CID", 1002)
+        if ldl in self.roles and self.roles[ldl].alive:
+            self._npc_cast_ldl(ldl)
+
+        self._compact()
+
+    def _npc_random_reinsert(self, cid: int):
+        if cid in self.rank:
+            try:
+                self.rank.remove(cid)
+            except ValueError:
+                pass
+        pos = self.rng.randint(0, len(self.rank))
+        self.rank.insert(pos, cid)
+
+    def _npc_adjacent_two(self, cid: int):
+        if cid not in self.rank:
+            return []
+        i = self.rank.index(cid)
+        res = []
+        if i - 1 >= 0:
+            res.append(self.rank[i - 1])
+        if i + 1 < len(self.rank):
+            res.append(self.rank[i + 1])
+        return res
+
+    def _npc_cast_hw(self, cid: int):
+        casts = int(self.roles[cid].mem.get("npc_casts", 0))
+        if casts >= 3:
+            self.roles[cid].alive = False
+            self.rank = [x for x in self.rank if x != cid]
+            self._log("  · 洪伟离场")
+            return
+
+        self._npc_random_reinsert(cid)
+        neigh = self._npc_adjacent_two(cid)
+        for t in neigh:
+            if t in self.roles and self.roles[t].alive:
+                # 永久护盾：perm=True, ttl=0
+                self.give_shield(t, 1, ttl=0, perm=True, note="洪伟赐福(永久)")
+        self.roles[cid].mem["npc_casts"] = casts + 1
+        self._log(f"  · 洪伟施法：随机换位，并为相邻2人添加永久护盾（第{casts+1}/3次）")
+
+        if casts + 1 >= 3:
+            self.roles[cid].alive = False
+            self.rank = [x for x in self.rank if x != cid]
+            self._log("  · 洪伟离场")
+
+    def _npc_cast_ldl(self, cid: int):
+        casts = int(self.roles[cid].mem.get("npc_casts", 0))
+        if casts >= 3:
+            self.roles[cid].alive = False
+            self.rank = [x for x in self.rank if x != cid]
+            self._log("  · 李东雷离场")
+            return
+
+        self._npc_random_reinsert(cid)
+        neigh = self._npc_adjacent_two(cid)
+        for t in neigh:
+            if t in self.roles and self.roles[t].alive:
+                before_t = self.roles[t].status.brief()
+                self.roles[t].status.thunder += 1
+                self._oulu_bump_on_status_change(t, before_t)
+                if self.roles[t].status.thunder >= 3:
+                    self._log(f"  · 雷霆满3：{self.N(t)} 立刻死亡")
+                    self.kill(t, None, "雷霆叠满3层处决", bypass_shield=False, bypass_revive=True)
+
+        self.roles[cid].mem["npc_casts"] = casts + 1
+        self._log(f"  · 李东雷施法：随机换位，并为相邻2人添加1层雷霆（第{casts+1}/3次）")
+
+        if casts + 1 >= 3:
+            self.roles[cid].alive = False
+            self.rank = [x for x in self.rank if x != cid]
+            self._log("  · 李东雷离场")
+
+# =========================
     # 步骤2：主动技能
     # =========================
-
     def step_active_skills(self):
-        alive = self.alive_ids()
-        if self.turn == 1:
-            order = alive[:]
-            self.rng.shuffle(order)
-            self._log("【主动技能】第1回合随机顺序")
-        else:
-            order = sorted(alive)
-            self._log("【主动技能】从第2回合起按序号执行")
-
+        # 新规则：每局游戏随机生成一个技能发动顺序，之后每回合按该顺序进行
+        if not self.skill_order:
+            # 兜底：若未生成则立即生成一次（不输出日志）
+            self.skill_order = self.alive_ids()[:]
+            self.rng.shuffle(self.skill_order)
+        alive_set = {cid for cid in self.alive_ids()}
+        # 按固定顺序遍历：只执行存活者；顺序列表中若有人已死亡则跳过
+        order = [cid for cid in self.skill_order if cid in alive_set]
         for cid in order:
             if not self.roles[cid].alive:
                 continue
-
-            # 黄昏标记：每次发动主动后-1名
-            # 注意：如果技能无法发动（封印/遗忘/永久失效），不算发动
             if not self.can_act(cid):
                 why = "遗策" if self.roles[cid].status.perma_disabled else ("封印" if self.roles[cid].status.sealed > 0 else "遗忘")
                 self._log(f"  · {self.N(cid)} 无法发动（{why}）")
                 continue
-
-            # 合议庭审判：被审判者当回合技能无效 —— 我们用 mem["judged_this_turn"]=True，在其行动时拦截
-            if self.roles[cid].mem.get("judged_this_turn"):
-                self._log(f"  · {self.N(cid)} 本回合被审判：技能无效")
-                continue
-
-            self._log(f"【{cid}. {self.N(cid)}】发动主动技能…")
+            if cid not in self._active_logged:
+                self._active_logged.add(cid)
+                self._log(f"【{self.N(cid)}】发动主动技能…")
+            if cid == 33 and self.roles[33].alive and (not self.roles[33].status.perma_disabled):
+                st33 = self.roles[33].status
+                if st33.spec_immune_ttl > 0 and (not st33.spec_immune_gained_this_turn):
+                    self.move_to_first(33, source=None, note="特异性免疫发动时升至第1名")
+                else:
+                    # 沈澄婕：若发动时没有【特异性免疫】，则上升2名
+                    self.move_by(33, -2, source=None, note="无特异性免疫发动上升2名")
+            # 施禹谦(36) 天罚灭世：若上回合排名下降，则在本回合发动主动技能前升至第一并获得【神威】
+            if cid == 36 and self.roles[36].alive and (not self.roles[36].status.perma_disabled):
+                if self.roles[36].mem.get("tfms_pending", False):
+                    if self.rank_no(36) != 1:
+                        before36 = self.roles[36].status.brief()
+                        self.roles[36].status.shenwei = True
+                        self._on_status_change(36, before36)
+                        self.move_to_first(36, source=None, note="天罚灭世触发：升至第1名并获得神威")
+                        self._log("  · 天罚灭世触发：上回合排名下降 → 本回合发动时升至第一并获得【神威】")
+                    self.roles[36].mem["tfms_pending"] = False
             self.dispatch_active(cid)
-
-            # 发动后：黄昏标记惩罚
             if self.roles[cid].status.dusk_mark > 0:
                 self._log(f"  · 黄昏标记：{self.N(cid)} 因发动主动，排名下降1位")
-                self.move_by(cid, +1, note="黄昏标记惩罚")
-
+                self.move_by(cid, +1, source=None, note="黄昏标记惩罚")
     def dispatch_active(self, cid: int):
-        fn = {
+        fn_map = {
             1: self.act_1,
-            2: self.act_2,
             3: self.act_3,
             4: self.act_4,
-            5: self.act_5,
             6: self.act_6,
             7: self.act_7,
             8: self.act_8,
@@ -808,32 +1507,59 @@ class Engine:
             19: self.act_19,
             20: self.act_20,
             21: self.act_21,
-            22: self.act_22,
             23: self.act_23,
             24: self.act_24,
             25: self.act_25,
             26: self.act_26,
-        }[cid]
-        fn()
-
+            27: self.act_27,
+            29: self.act_29,
+            34: self.act_34,
+            36: self.act_36,
+            38: self.act_38,
+            39: self.act_39,
+            40: self.act_40,
+            41: self.act_41,
+            33: self.act_33,
+                    42: self.act_42,
+                    46: self.act_46,
+        }
+        fn = fn_map.get(cid)
+        if fn is None:
+            self._log(f"  · 无主动技能")
+            return
+        try:
+            fn()
+        except Exception as e:
+            import traceback as _tb
+            tb = _tb.format_exc()
+            self.skill_exception_count += 1
+            if len(self.skill_exception_examples) < 20:
+                self.skill_exception_examples.append((cid, f"{type(e).__name__}: {e}", tb))
+            if getattr(self, "export_error_log", False):
+                try:
+                    with open(self._error_log_path(), "a", encoding="utf-8") as f:
+                        f.write("\n=== Skill Exception turn=%s cid=%s name=%s ===\n" % (self.turn, cid, self.N(cid)))
+                        f.write("%s: %s\n" % (type(e).__name__, e))
+                        f.write(tb + "\n")
+                except Exception:
+                    pass
+            if not self.fast_mode:
+                self._log(f"  · 【异常】{self.N(cid)} 的主动技能错误：{type(e).__name__}: {e}")
+            return
     # =========================
-    # 步骤3：死亡触发技能
+    # 步骤3：死亡触发
     # =========================
-
     def step_death_triggers(self):
         if not self.deaths_this_turn:
             self._log("【死亡触发】本回合无死亡")
             return
         self._log("【死亡触发】按死亡顺序处理：")
-        # 注意：死亡触发按死亡顺序；死亡触发里可能再杀人/复活
         i = 0
         while i < len(self.deaths_this_turn):
             rec = self.deaths_this_turn[i]
             i += 1
             v = rec.victim
-            if v == 2:
-                self.on_death_2()
-            elif v == 7:
+            if v == 7:
                 self.on_death_7(rec.killer)
             elif v == 9:
                 self.on_death_9()
@@ -841,88 +1567,251 @@ class Engine:
                 self.on_death_14(rec.killer)
             elif v == 23:
                 self.on_death_23()
-            elif v == 5:
-                self.on_death_5()
-
     # =========================
-    # 步骤4：更新/清理 + 补刀
+    # 步骤4：更新/清理 + 被动
     # =========================
-
     def step_update_and_cleanup(self):
         self._compact()
         self.spread_corruption_and_check()
+                # 29 严雅：净化爆发（回合结束时判定；净化能量已改为在主动释放时触发）
+        if self.roles.get(29) and self.roles[29].alive and (not self.roles[29].status.perma_disabled):
+            alive_rank = [c for c in self.rank if self.roles[c].alive]
+            for i in range(len(alive_rank) - 2):
+                a, b, c = alive_rank[i], alive_rank[i + 1], alive_rank[i + 2]
+                if getattr(self.roles[a].status, "purify_ttl", 0) > 0 and getattr(self.roles[b].status, "purify_ttl", 0) > 0 and getattr(self.roles[c].status, "purify_ttl", 0) > 0:
+                    # 清除三人的全部状态（保留perma_disabled与fake标记）
+                    for x in (a, b, c):
+                        stx = self.roles[x].status
+                        perm = stx.perma_disabled
+                        fake = stx.__dict__.get("fake_99999", False)
+                        self.roles[x].status = Status(perma_disabled=perm)
+                        self.roles[x].status.__dict__["fake_99999"] = fake
+                    # 设置冷却
+                    self.roles[29].mem["purify_cd"] = 2
+                    self._log(f"  · 净化爆发：{self.N(a)}、{self.N(b)}、{self.N(c)} 相邻且均有净化 → 清除全部状态；{self.N(b)} 直升第一")
+                    self.insert_rank(b, 1, source=None, note="净化爆发直升第一")
+                    break
 
-        # 状态衰减
         for cid in self.alive_ids():
             st = self.roles[cid].status
-            # 临时护盾持续回合-1，到0清空临时层
+            before_brief_u = st.brief()
+            # 29 严雅：静默审判（若本回合除静默外状态未改变，则获得静默；若已有静默则消耗并上升2名）
+            if cid == 28 and (not st.perma_disabled):
+                if getattr(st, "silent_ttl", 0) > 0:
+                    self.move_by(28, -2, source=None, note="静默审判上升2名")
+                    st.silent_ttl = 0
+                else:
+                    start_sig = self.roles[29].mem.get("start_status_no_silent", "")
+                    now_sig = self._status_sig_no_silent(28)
+                    if start_sig == now_sig:
+                        st.silent_ttl = 1
+                        self._log(f"  · 静默审判：{self.N(28)} 获得【静默】")
+
+
+
+            # 45 蒋骐键：锁定防线（本回合下降>=2名触发）
+            if cid == 45 and (not st.perma_disabled):
+                sr = self.roles[45].mem.get("start_rank", None)
+                cr = self.rank_no(45)
+                if sr is not None and cr is not None and (cr - sr) >= 2 and getattr(st, "defense_line_ttl", 0) == 0:
+                    st.defense_line_ttl = 2
+                    st.defense_line_block = False
+                    self._log(f"  · 锁定防线：{self.N(45)} 获得【防线】(2回合)")
+                    self.roles[29].mem["silent_grant_turn"] = self.turn
             if st.shield_ttl > 0:
                 st.shield_ttl -= 1
                 if st.shield_ttl == 0:
                     st.shields = 0
-
             if st.sealed > 0:
                 st.sealed -= 1
             if st.forgotten > 0:
                 st.forgotten -= 1
-            if st.cant_gain_shield_next > 0:
-                st.cant_gain_shield_next -= 1
+            if st.juexi_ttl > 0:
+                st.juexi_ttl -= 1
 
-            # 回合结束清除集火/挡刀设置
-            st.focused = False
-            st.guard_for = None
-            st.guard_used = False
+            if st.dying_ttl > 0:
+                st.dying_ttl -= 1
+            if st.spec_immune_ttl > 0:
+                st.spec_immune_ttl -= 1
 
-        # 钟无艳巾帼护盾：回合结束若排名上升≥2位，50%得1盾（不可叠加，最多3次）；持盾被集火盾立即消失
+            # 迂回：回合结算下降1名
+            if getattr(st, "detour_ttl", 0) > 0:
+                self.move_by(cid, 1, source=None, note="迂回下降1名")
+                st.detour_ttl -= 1
+
+            # 防线：回合结算上升1名
+            if getattr(st, "frontline_cd", 0) > 0:
+                st.frontline_cd -= 1
+
+            if getattr(st, "defense_line_ttl", 0) > 0:
+                self.move_by(cid, -1, source=None, note="防线上升1名")
+                st.defense_line_ttl -= 1
+                if st.defense_line_ttl <= 0:
+                    st.defense_line_block = False
+
+            # 迫近战线冷却
+            if getattr(st, "frontline_cd", 0) > 0:
+                st.frontline_cd -= 1
+
+# 辩护：持续期间每回合上升1名
+            if getattr(st, "defense_ttl", 0) > 0:
+                self.move_by(cid, -1, source=None, note="辩护上升1名")
+                st.defense_ttl -= 1
+
+            # 圣辉：持续期间每回合上升1名
+            if getattr(st, "shenghui_ttl", 0) > 0:
+                self.move_by(cid, -1, source=None, note="圣辉上升1名")
+                st.shenghui_ttl -= 1
+
+            # 感电：叠满3层后，每回合消耗1层并上升3名
+            if getattr(st, "dian", 0) >= 3:
+                self.move_by(cid, -3, source=None, note="感电爆发上升3名")
+                st.dian = max(0, st.dian - 1)
+
+            # 乘胜追击：叠满3层后，每回合上升3名
+            if getattr(st, "chase", 0) >= 3:
+                self.move_by(cid, -3, source=None, note="乘胜追击上升3名")
+
+            # 氧化/还原：每回合位移并衰减
+            if getattr(st, "oxid_ttl", 0) > 0:
+                self.move_by(cid, -1, source=None, note="氧化上升1名")
+                st.oxid_ttl -= 1
+            if getattr(st, "reduce_ttl", 0) > 0:
+                self.move_by(cid, +1, source=None, note="还原下降1名")
+                st.reduce_ttl -= 1
+
+            # 洪伟之赐：持有期间每回合上升2名（直到抵挡一次伤害被消耗）
+            if getattr(st, "hongwei_gift_shield", 0) > 0:
+                self.move_by(cid, -2, source=None, note="洪伟之赐上升2名")
+            # 雷霆手腕：持有期间每回合给上一名雷霆+1（直到抵挡一次伤害被消耗）
+            if getattr(st, "thunder_wrist_shield", 0) > 0:
+                myr = self.rank_no(cid)
+                if myr is not None and myr > 1:
+                    above = self.rank[myr - 2]
+                    if above in self.roles and self.roles[above].alive:
+                        before_a = self.roles[above].status.brief()
+                        self.roles[above].status.thunder += 1
+                        self._on_status_change(above, before_a)
+                        self._log(f"  · 雷霆手腕：{self.N(cid)} 令 {self.N(above)} 雷霆层数={self.roles[above].status.thunder}")
+                        if self.roles[above].status.thunder >= 3:
+                            self._log(f"  · 雷霆满3：{self.N(above)} 立刻死亡")
+                            self.kill(above, None, "雷霆叠满3层处决", bypass_shield=False, bypass_revive=True)
+                            self._compact()
+
+            
+            # 32 范一诺：清障圣辉——若本回合名次下降，则获得3回合圣辉；圣辉期间每回合上升1名
+            if cid == 32 and (not st.perma_disabled) and self.roles[32].alive:
+                start_r = self.start_rank_snapshot.get(32)
+                now_r = self.rank_no(32)
+                if start_r is not None and now_r is not None and now_r > start_r:
+                    st32 = self.roles[32].status
+                    st32.shenghui_ttl = 3
+                    self._log(f"  · 清障圣辉：{self.N(32)} 本回合排名下降 → 获得【圣辉】(3回合)")
+
+            # 施沁皓(3) 斩杀冷却递减
+            if cid == 3:
+                cd3 = int(self.roles[3].mem.get("execute_cd", 0))
+                if cd3 > 0:
+                    self.roles[3].mem["execute_cd"] = cd3 - 1
+
+            # 路济阳(17) 护佑之盾冷却递减
+            if cid == 17:
+                cd2 = int(self.roles[17].mem.get("shield_cd", 0))
+                if cd2 > 0:
+                    self.roles[17].mem["shield_cd"] = cd2 - 1
+            # 施禹谦(36) 天罚灭世：若本回合排名下降，则标记下回合发动时升至第一并获得【神威】
+            if cid == 36 and (not st.perma_disabled) and self.roles[36].alive:
+                cur = self.rank_no(36)
+                prev = self.roles[36].mem.get("last_rank")
+                if prev is not None and cur is not None and cur > int(prev):
+                    self.roles[36].mem["tfms_pending"] = True
+                self.roles[36].mem["down_streak"] = 0
+                now_after = self.rank_no(36)
+                if now_after is not None:
+                    self.roles[36].mem["last_rank"] = int(now_after)
+            
+            # 28 黄梓睿：净化能量——每回合给自己与相邻两人施加2回合净化；三人净化相邻则触发净化爆发
+            if False and cid == 29 and (not st.perma_disabled) and self.roles[29].alive:
+                cd = int(self.roles[29].mem.get("purify_cd", 0))
+                if cd > 0:
+                    self.roles[29].mem["purify_cd"] = cd - 1
+                else:
+                    self.roles[29].mem["purify_cd"] = 0
+                p29 = self.pos(29)
+                if cd > 0:
+                    # 冷却中，跳过本回合净化施加与判定
+                    return
+                targets = []
+                if p29 is not None:
+                    for q in (p29-1, p29, p29+1):
+                        if 0 <= q < len(self.rank):
+                            t = self.rank[q]
+                            if self.roles[t].alive:
+                                targets.append(t)
+                if targets:
+                    for t in targets:
+                        before_t = self.roles[t].status.brief()
+                        self.roles[t].status.purify_ttl = max(getattr(self.roles[t].status, "purify_ttl", 0), 2)
+                        self._on_status_change(t, before_t)
+                    self._log("  · 净化能量：" + "、".join(self.N(x) for x in targets) + " 获得【净化】(2回合)")
+
+                # 检查连续三人均有净化
+                alive_rank = [c for c in self.rank if self.roles[c].alive]
+                for i in range(len(alive_rank)-2):
+                    a,b,c = alive_rank[i], alive_rank[i+1], alive_rank[i+2]
+                    if getattr(self.roles[a].status, "purify_ttl", 0)>0 and getattr(self.roles[b].status, "purify_ttl", 0)>0 and getattr(self.roles[c].status, "purify_ttl", 0)>0:
+                        # 清除三人的所有状态效果（保留永久禁用等硬规则字段）
+                        for x in (a,b,c):
+                            stx=self.roles[x].status
+                            perm = stx.perma_disabled
+                            fake = stx.__dict__.get("fake_99999", False)
+                            self.roles[x].status = Status(perma_disabled=perm)
+                            self.roles[x].status.__dict__["fake_99999"]=fake
+                        self.roles[29].mem["purify_cd"] = 2
+                        self._log(f"  · 净化爆发：{self.N(a)}、{self.N(b)}、{self.N(c)} 相邻且均有净化 → 清除全部状态；{self.N(b)} 直升第一")
+                        self.insert_rank(b, 1, source=None, note="净化爆发直升第一")
+                        break
+
+            # 季任杰(34) 越挫越勇：回合末结算（被动）
+            if cid == 34 and (not st.perma_disabled) and self.roles[34].alive:
+                alive_now = self.alive_ids()
+                cur_rank = self.rank_no(34)
+                if cur_rank is not None:
+                    # 倒数第一且不在前三：立刻升至第一并移除效果
+                    if cur_rank == len(alive_now) and cur_rank > 3:
+                        if st.vyzy:
+                            st.vyzy = False
+                        self._log("  · 越挫越勇：倒数第一触发 → 立刻升至第一并移除【越挫越勇】")
+                        self.insert_rank(34, 1, source=None, note="越挫越勇触底反弹")
+                    else:
+                        # 不在前三：获得/保持越挫越勇，并每回合下降2名
+                        if cur_rank > 3:
+                            if not st.vyzy:
+                                before34 = st.brief()
+                                st.vyzy = True
+                                self._log("  · 越挫越勇：不在前三 → 获得【越挫越勇】")
+                                self._oulu_bump_on_status_change(34, before34)
+                            self.move_by(34, +2, source=None, note="越挫越勇下降2名")
+                        # 进入前三：移除越挫越勇
+                        else:
+                            if st.vyzy:
+                                before34 = st.brief()
+                                st.vyzy = False
+                                self._log("  · 越挫越勇：进入前三 → 移除【越挫越勇】")
+                                self._oulu_bump_on_status_change(34, before34)
+
+            if cid == 46 and st.lone_wolf and (not st.perma_disabled):
+                self.move_by(46, -1, source=None, note="孤军奋战")
+
+
+            self._oulu_bump_on_status_change(cid, before_brief_u)
+        # 钟无艳巾帼护盾
         self.endcheck_zhongwuyan()
-
-
-        # 豆进天天命所归（被动）：若排名在后30%则立即升至第一并获得1盾(2回合)
+        # 豆进天被动
         self.check_doujintian_passive()
-
-        # 牵寒逆流而上（被动）：若排名在后40%免疫下次技能效果并排名+1
-        # 工程化：给一个标记 "qian_immune_next" 作为“免疫下次技能影响”
+        # 牵寒被动
         self.check_qianhan_passive()
-
-        # 钟无艳“持盾被集火护盾消失”：集火在回合末已清，这里按规则（若回合中被集火且有盾）应该立即消失
-        # 工程化：我们在“设置集火时”就处理掉钟无艳的盾（见 act_7）
-
-    def step_world_bonus(self):
-        """
-        补刀机制：
-        - 若连续两回合无人死亡，则从第三回合开始额外处决最后一名（与第4名同时处决）
-        - 当存活≤3 且连续2回合无人死亡：末位强制处决（无视免疫）
-        """
-        alive = self.alive_ids()
-        if not alive:
-            return
-
-        if len(alive) <= 3 and self.no_death_streak >= 2:
-            target = alive[-1]
-            self._log(f"【补刀】存活≤3且连续2回合无人死亡：强制处决末位 {self.N(target)}（无视免疫）")
-            self.kill(
-                target,
-                None,
-                "强制补刀",
-                bypass_shield=True,
-                bypass_guard=True,
-                bypass_revive=True
-            )
-            self.step_death_triggers()
-            self._compact()
-            return
-
-        if self.no_death_streak >= 2 and len(alive) >= 4:
-            target = alive[-1]
-            self._log(f"【补刀】连续两回合无人死亡：额外处决末位 {self.N(target)}")
-            self.kill(target, None, "世界规则补刀处决", bypass_shield=False)
-            self.step_death_triggers()
-            self._compact()
-
-    # =========================
-    # 被动/回合末检查
-    # =========================
-
+        self.check_qiyinlu_lone_wolf()
     def check_doujintian_passive(self):
         if not self.roles[11].alive or self.roles[11].status.perma_disabled:
             return
@@ -930,39 +1819,52 @@ class Engine:
         r = self.rank_no(11)
         if r is None:
             return
-        # 后30%：rank > 70%*N
         if r > int(len(alive) * 0.7):
-            self._log(f"  · 豆进天(11) 天命所归触发：从后30%升至第一并获得护盾1层(2回合)")
-            # 移到第1名
-            self.insert_rank(11, 1, note="天命所归升至第一")
-            # 护盾1层，持续2回合（工程化：作为临时盾ttl=2）
+            self._log("  · 豆进天(11) 天命所归触发：升至第一并获得护盾1层(2回合)")
+            self.insert_rank(11, 1, source=None, note="天命所归升至第一")
             self.give_shield(11, 1, ttl=2, perm=False, note="天命所归护盾")
-
     def check_qianhan_passive(self):
         if not self.roles[6].alive or self.roles[6].status.perma_disabled:
             return
+
+    def check_qiyinlu_lone_wolf(self):
+        if 46 not in self.roles or (not self.roles[46].alive) or self.roles[46].status.perma_disabled:
+            return
+        r = self.roles[46]
+        if r.status.lone_wolf:
+            return
+        mates = r.mem.get("mates", [])
+        if len(mates) != 2:
+            return
+        if all((m in self.roles) and (not self.roles[m].alive) for m in mates):
+            before = r.status.brief()
+            self.give_shield(46, 1, ttl=1, perm=False, note="孤军奋战触发护盾")
+            r.status.lone_wolf = True
+            self._log("  · 孤军奋战：两名队友均被淘汰 → 获得永久【孤军奋战】（每回合上升1名）")
+            self._on_status_change(46, before)
         alive = self.alive_ids()
         r = self.rank_no(6)
         if r is None:
             return
-        # 后40%：rank > 60%*N
         if r > int(len(alive) * 0.6):
             if not self.roles[6].mem.get("qian_immune_next", False):
                 self.roles[6].mem["qian_immune_next"] = True
                 self._log("  · 牵寒(6) 逆流而上触发：免疫下次技能影响并排名+1")
-                self.move_by(6, -1, note="逆流而上+1")
-
-                # 寒锋逆雪：当逆流触发时，额外斩杀随机高于自身一人
-                higher = [x for x in self.alive_ids() if self.rank_no(x) is not None and self.rank_no(x) < self.rank_no(6)]
+                self.move_by(6, -1, source=None, note="逆流而上+1")
+                higher = [x for x in self.alive_ids()
+                          if self.rank_no(x) is not None and self.rank_no(x) < self.rank_no(6)]
                 if higher:
                     t = self.rng.choice(higher)
                     if not self.is_mls_unselectable_by_active_kill(t):
                         self._log(f"  · 寒锋逆雪：斩杀高位随机目标 {self.N(t)}")
                         self.kill(t, 6, "寒锋逆雪条件斩杀")
                     else:
-                        self._log("  · 寒锋逆雪：随机到mls(10)，无法被主动斩杀选中 → 失败")
-
+                        self._log("  · 寒锋逆雪：随机到mls(10)不可选 → 失败")
     def endcheck_zhongwuyan(self):
+        # 钟无艳(21)
+        # 回合结束：只要本回合排名上升（≥1位），就触发判定：
+        # - 50%概率获得1层护盾（最多触发3次，且需要当前没有护盾才可抽取）
+        # - 若本次未获得护盾，则直接冲到第一名。
         if not self.roles[21].alive or self.roles[21].status.perma_disabled:
             return
         st = self.roles[21].status
@@ -970,23 +1872,24 @@ class Engine:
         now = self.rank_no(21)
         if start is None or now is None:
             return
+
         rise = start - now
-        if rise >= 2 and st.zhong_triggers < 3:
-            if st.total_shields() == 0:
-                if self.rng.random() < 0.5:
-                    st.zhong_triggers += 1
-                    self.give_shield(21, 1, ttl=1, perm=False, note="巾帼护盾判定")
-            else:
-                # 不可叠加
-                pass
+        if rise < 1:
+            return
 
+        gained = False
+        # 只有在：触发次数未满3次 且 当前没有任何护盾 时，才允许进行“50%抽盾”
+        if st.zhong_triggers < 3 and st.total_shields() == 0:
+            if self.rng.random() < 0.5:
+                st.zhong_triggers += 1
+                self.give_shield(21, 1, ttl=1, perm=False, note="巾帼护盾判定")
+                gained = True
 
-    # =========================
-    # hewenx 怨念爆发：下回合行动前结算
-    # =========================
-
+        # 未获得护盾：直接冲到第一
+        if not gained:
+            self._log("  · 巾帼未获盾→直冲第一")
+            self.insert_rank(21, 1, source=None, note="巾帼未获盾→直冲第一")
     def apply_hewenx_curse_preaction(self):
-        # 找到带有“hewenx_curse”的凶手，判断排名是否“高于阈值”（数字更小）
         for cid in self.alive_ids():
             curse = self.roles[cid].status.hewenx_curse
             if not curse:
@@ -998,16 +1901,12 @@ class Engine:
                 continue
             if cur < threshold:
                 self._log(f"【怨念爆发】{self.N(cid)} 行动前判定：排名高于阈值 → 直接斩杀（护盾无效）")
-                self.kill(cid, 7, "怨念爆发斩杀(护盾无效)", bypass_shield=True)
+                self.kill(cid, 7, "怨念爆发斩杀(护盾无效)", bypass_shield=True, bypass_revive=True)
             self.roles[cid].status.hewenx_curse = None
-        # 若这里产生死亡，等同于“本回合开始前死亡”，不触发本回合死亡触发（你原文写的是下回合行动前斩杀；这里仍记在日志中，但不进入本回合 deaths_this_turn）
         self._compact()
-
     # =========================
-    # 26人技能实现：主动
+    # 主动技能实现
     # =========================
-
-    # 1 金逸阳：逆袭之光(每3回合必发) + 光影裁决联动斩杀
     def act_1(self):
         r = self.roles[1]
         r.mem["counter"] = r.mem.get("counter", 0) + 1
@@ -1021,185 +1920,154 @@ class Engine:
         if myr <= int(len(alive) * 0.4):
             self._log("  · 逆袭之光：不在后60%，条件不满足")
             return
-        front = alive[:max(1, len(alive)//2)]
-        target = self.rng.choice([x for x in front if x != 1])
+        front = alive[:max(1, len(alive) // 2)]
+        target = self.pick_random(1, [x for x in front if x != 1], "逆袭之光交换目标")
+        if target is None:
+            return
         old_rank = myr
-        self.swap(1, target, note="逆袭之光")
-        # 光影裁决：斩杀交换前自身原排名位置的角色
+        self.swap(1, target, source=1, note="逆袭之光")
         self._compact()
         if old_rank <= len(self.rank):
             v = self.rank[old_rank - 1]
             if v != 1:
                 self._log(f"  · 光影裁决：斩杀原第{old_rank}名位置的 {self.N(v)}")
                 self.kill(v, 1, "光影裁决联动斩杀")
-
-    # 2 潘乐一：厄运预兆 + 死亡触发遗志诅咒
-    def act_2(self):
-        """潘乐一（2）
-        主动【讲冷笑话】：
-        - 每回合：对“已携带霜冻”的角色，额外使其排名下降1名
-        - 并为与自己排名相邻的两人施加【霜冻】（浅蓝色）
-        说明：霜冻为持续状态；潘乐一死亡后，全场霜冻清空（见 on_death_2）。
-        """
-        alive = self.alive_ids()
-        if len(alive) <= 1:
-            self._log("  · 讲冷笑话：场上人数不足")
-            return
-
-        # ① 先结算：已霜冻者每回合下降1名（不包含潘乐一自身）
-        frosted = [cid for cid in alive if cid != 2 and self.roles[cid].status.frost]
-        if frosted:
-            self._log("  · 讲冷笑话：霜冻结算（已霜冻者本回合下降1名）")
-            for t in frosted:
-                self.move_by(t, +1, note="霜冻结算-1")
-
-        # ② 再对相邻两人施加霜冻（本回合新获得霜冻不立刻触发下降）
-        alive2 = self.alive_ids()
-        p = self.pos(2)
-        if p is None:
-            return
-        neigh = []
-        if p - 1 >= 0:
-            neigh.append(alive2[p - 1])
-        if p + 1 < len(alive2):
-            neigh.append(alive2[p + 1])
-
-        if not neigh:
-            self._log("  · 讲冷笑话：无相邻目标")
-            return
-
-        self._log("  · 讲冷笑话：为相邻目标施加霜冻")
-        for t in neigh[:2]:
-            if t == 2 or (not self.roles[t].alive):
-                continue
-            if not self.roles[t].status.frost:
-                self.roles[t].status.frost = True
-                self._log(f"    - {self.N(t)} 获得【霜冻】")
-            else:
-                self._log(f"    - {self.N(t)} 已有【霜冻】")
-
-
-    # 3 施沁皓：凌空决（主动斩杀高位，姚宇涛免疫；失败则自身-2）
     def act_3(self):
         myr = self.rank_no(3)
         if myr is None:
             return
-        higher = [x for x in self.alive_ids() if self.rank_no(x) is not None and self.rank_no(x) < myr]
+        cd = int(self.roles[3].mem.get("execute_cd", 0))
+        if cd > 0:
+            self._log(f"  · 凌空决：斩杀冷却中（剩余{cd}回合）")
+            return
+        higher = [x for x in self.alive_ids()
+                  if self.rank_no(x) is not None and self.rank_no(x) < myr]
         if not higher:
             self._log("  · 凌空决：无更高排名目标")
             return
-        target = self.rng.choice(higher)
-        if target == 5:
-            self._log("  · 凌空决：姚宇涛免疫 → 失败，自身下降2位")
-            self.move_by(3, +2, note="凌空决失败惩罚")
+        target = self.pick_random(3, higher, "凌空决目标")
+        if target is None:
             return
         if self.is_mls_unselectable_by_active_kill(target):
             self._log("  · 凌空决：目标为mls(10)绝对防御不可选 → 失败，自身下降2位")
-            self.move_by(3, +2, note="凌空决失败惩罚")
+            self.move_by(3, +2, source=3, note="凌空决失败惩罚")
             return
-        # 若牵寒免疫下次技能影响
         if target == 6 and self.roles[6].mem.get("qian_immune_next"):
             self.roles[6].mem["qian_immune_next"] = False
             self._log("  · 凌空决：牵寒免疫下次技能影响 → 斩杀无效；自身下降2位")
-            self.move_by(3, +2, note="凌空决失败惩罚")
+            self.move_by(3, +2, source=3, note="凌空决失败惩罚")
             return
         self._log(f"  · 凌空决：斩杀更高位目标 {self.N(target)}")
         died = self.kill(target, 3, "凌空决主动斩杀")
+        if died:
+            self.roles[3].mem["execute_cd"] = 2
         if not died:
-            self._log("  · 凌空决：斩杀被抵挡（护盾/挡刀），自身下降2位")
-            self.move_by(3, +2, note="凌空决失败惩罚")
-
-    # 4 朱昊泽：绝息斩（每回合斩杀后3随机一人；集火必中）
+            self._log("  · 凌空决：斩杀被抵挡（护盾），自身下降2位")
+            self.move_by(3, +2, source=3, note="凌空决失败惩罚")
+    # 10) 朱昊泽完全重做
     def act_4(self):
-        alive = self.alive_ids()
-        if len(alive) <= 1:
-            self._log("  · 绝息斩：目标不足")
+        r = self.roles[4]
+        # 每两回合发动：第2、4、6…回合可尝试
+        if self.turn % 2 != 0:
+            self._log("  · 绝息斩：未到发动回合（每两回合）")
+            self._log("  · 朱昊泽 获得【绝息】")
             return
-        last3 = alive[-3:] if len(alive) >= 3 else alive
-        focus = [x for x in last3 if self.roles[x].status.focused]
-        target = focus[0] if focus else self.rng.choice(last3)
-        self._log(f"  · 绝息斩：目标 {self.N(target)}" + ("（集火必中）" if focus else ""))
-        self.kill(target, 4, "绝息斩随机斩杀")
-
-    # 5 姚宇涛：君临天下（连续两回合第一）+ 死亡被动王者替身
-    def act_5(self):
-        r = self.roles[5]
-        # 冷却
-        cd = r.mem.get("cd", 0)
-        if cd > 0:
-            r.mem["cd"] = cd - 1
-            self._log("  · 君临天下：冷却中")
+        myr = self.rank_no(4)
+        if myr is None:
             return
-        # 连续第一计数
-        if self.rank_no(5) == 1:
-            r.mem["streak"] = r.mem.get("streak", 0) + 1
-        else:
-            r.mem["streak"] = 0
-        if r.mem.get("streak", 0) >= 2:
-            alive = self.alive_ids()
-            last = alive[-1]
-            self._log(f"  · 君临天下：斩杀末位 {self.N(last)} 并打乱其他角色排名（冷却2）")
-            self.kill(last, 5, "君临天下强制斩杀末位")
-            # 打乱除自己外
-            others = [x for x in self.alive_ids() if x != 5]
-            self.rng.shuffle(others)
-            self.rank = [5] + others
-            r.mem["cd"] = 2
-        else:
-            self._log("  · 君临天下：条件不满足（需连续两回合第一）")
-
-    # 6 牵寒：主动无；被动已在回合末处理（逆流而上、寒锋逆雪）
+        if myr <= 4:
+            self._log("  · 绝息斩：不存在“比自己高4名的人” → 无法发动")
+            return
+        target_rank = myr - 4
+        target = self.rank[target_rank - 1]  # 恰好高4名
+        if not self.roles[target].alive:
+            self._log("  · 绝息斩：目标已死亡 → 无法发动")
+            return
+        if self.is_mls_unselectable_by_active_kill(target):
+            self._log("  · 绝息斩：目标为mls(10)不可被主动斩杀 → 无法发动")
+            return
+        # 绝息路径：发动前第(target_rank+1 .. myr-1) 共3人获得1回合绝息
+        path = []
+        for rk in range(target_rank + 1, myr):
+            if rk - 1 < len(self.rank):
+                cid = self.rank[rk - 1]
+                if cid != 4 and self.roles[cid].alive:
+                    path.append(cid)
+        # 理论上恰好3人；保险起见截断
+        path = path[:3]
+        self._log(f"  · 绝息斩：斩杀第{target_rank}名 {self.N(target)} 并替换其位置")
+        # 先斩杀目标（护盾可挡；若挡住则不替换、不施加绝息）
+        died = self.kill(target, 4, "绝息斩斩杀")
+        if not died:
+            self._log("  · 绝息斩：斩杀被护盾抵消 → 不替换、不施加绝息")
+            return
+        # 替换位置：把4插到目标位置
+        self._compact()
+        # 目标死亡后其位置空缺：我们将 4 插入 target_rank
+        self.insert_rank(4, target_rank, source=None, note="绝息斩替换位置")
+        # 施加绝息（1回合）
+        if path:
+            self._log("  · 绝息效果：沿途获得一回合绝息：" + "、".join(self.N(x) for x in path))
+            for x in path:
+                new_ttl = max(self.roles[x].status.juexi_ttl, 1)
+                # 绝息为技能效果，走统一入口（可触发隐身/绝地反击/特异性免疫等）
+                self.set_status(x, 'juexi_ttl', new_ttl, 4, note='绝息')
     def act_6(self):
         self._log("  · 无主动技能（被动在回合末判定）")
-
-    # 7 hewenx：下位集火（指定集火；20%自集火）
+    # 9) hewenx：不再自集火；集火语义已重做（见 pick_random）
     def act_7(self):
-        alive = self.alive_ids()
-        target = self.rng.choice([x for x in alive if x != 7])
-        self.roles[target].status.focused = True
-        self._log(f"  · 下位集火：{self.N(target)} 被集火")
-        if self.rng.random() < 0.2:
-            self.roles[7].status.focused = True
-            self._log("  · 20%判定：hewenx也被集火")
-        # 钟无艳：持盾被集火则护盾立即消失
-        if target == 21 and self.roles[21].status.total_shields() > 0:
-            self.roles[21].status.shields = 0
-            self.roles[21].status.shield_perm = 0
-            self.roles[21].status.shield_ttl = 0
-            self._log("  · 钟无艳持盾被集火：护盾立即消失（孤傲规则）")
-
-    # 8 增进舒：日进千里（+1/+2轮换）+ 乘胜追击（无盾才斩）
+        alive = [x for x in self.alive_ids() if x != 7]
+        if not alive:
+            self._log("  · 下位集火：无目标")
+            return
+        target = self.pick_random(7, alive, "下位集火目标")
+        if target is None:
+            return
+        self.set_unique_focus(target, note=f"  · 下位集火：{self.N(target)} 获得【集火】（自我反噬版，顶掉场上其它集火）")
     def act_8(self):
+        # 曾靖舒(8)
+        # 每回合上升名次（奇数回合+1，偶数回合+2）。
+        # 联动斩杀：每3回合最多触发一次（不影响上升）。
         step = 1 if (self.turn % 2 == 1) else 2
         old = self.pos(8)
-        self.move_by(8, -step, note=f"日进千里+{step}")
-        # 联动：发动前紧邻后位
+        self.move_by(8, -step, source=8, note=f"日进千里+{step}")
         if old is None:
             return
+
+        last_kill_turn = self.roles[8].mem.get("zjs_last_kill_turn")
+        can_kill = (last_kill_turn is None) or ((self.turn - last_kill_turn) >= 3)
+
         alive_now = self.alive_ids()
         if old + 1 < len(alive_now):
             target = alive_now[old + 1]
             if self.roles[target].status.total_shields() == 0:
-                self._log(f"  · 乘胜追击：斩杀 {self.N(target)}（目标无护盾）")
-                self.kill(target, 8, "乘胜追击联动斩杀")
+                if can_kill:
+                    self._log(f"  · 乘胜追击：斩杀 {self.N(target)}（目标无护盾）")
+                    self.kill(target, 8, "乘胜追击联动斩杀")
+                    self.roles[8].mem["zjs_last_kill_turn"] = self.turn
+                else:
+                    self._log("  · 乘胜追击：斩杀冷却中（每3回合最多触发一次）")
             else:
                 self._log("  · 乘胜追击：目标有护盾，无法斩杀")
 
-    # 9 书法家：笔定乾坤(一次封印两人下回合主动) + 笔戮千秋(每两回合斩低位)
+    # 8) 书法家：笔戮千秋后上升两名
+    # 8) 书法家：笔戮千秋后上升两名
     def act_9(self):
         r = self.roles[9]
         if not r.mem.get("seal_used", False):
-            alive = self.alive_ids()
-            cand = [x for x in alive if x != 9]
-            if len(cand) >= 2:
-                a, b = self.rng.sample(cand, 2)
+            alive = [x for x in self.alive_ids() if x != 9]
+            if len(alive) >= 2:
+                a, b = self.rng.sample(alive, 2)
+                before_a = self.roles[a].status.brief()
+                before_b = self.roles[b].status.brief()
                 self.roles[a].status.sealed = max(self.roles[a].status.sealed, 1)
                 self.roles[b].status.sealed = max(self.roles[b].status.sealed, 1)
+                self._oulu_bump_on_status_change(a, before_a)
+                self._oulu_bump_on_status_change(b, before_b)
                 r.mem["seal_used"] = True
                 self._log(f"  · 笔定乾坤：封印 {self.N(a)}、{self.N(b)} 下一回合主动")
                 self.twin_share_nonkill(a, "seal")
                 self.twin_share_nonkill(b, "seal")
-
         cd = r.mem.get("kill_cd", 0)
         if cd > 0:
             r.mem["kill_cd"] = cd - 1
@@ -1212,96 +2080,110 @@ class Engine:
         if not lower:
             self._log("  · 笔戮千秋：无低位目标")
             return
-        target = self.rng.choice(lower)
+        target = self.pick_random(9, lower, "笔戮千秋目标")
+        if target is None:
+            return
         if self.is_mls_unselectable_by_active_kill(target):
             self._log("  · 笔戮千秋：随机到mls(10)不可选 → 失败")
         else:
             self._log(f"  · 笔戮千秋：斩杀 {self.N(target)}")
             self.kill(target, 9, "笔戮千秋主动斩杀")
         r.mem["kill_cd"] = 1
-
-    # 10 mls：无主动（被动在 mls_try_immune / 绝对防御在选中时处理）
+        # 新增：释放后可上升两名
+        self.move_by(9, -2, source=9, note="笔戮千秋后上升2名")
     def act_10(self):
         self._log("  · 无主动技能（绝对领域为被动）")
-
-    # 11 豆进天：无主动（被动回合末处理）
     def act_11(self):
         self._log("  · 无主动技能（天命所归为被动）")
-
-    # 12 放烟花：万象挪移·改（每回合释放 turn 次；每次随机与1人交换）
     def act_12(self):
-        times = max(1, self.turn)  # 第3回合=3次
-        self._log(f"  · 万象挪移：本回合连续释放 {times} 次")
-
+        # 放烟花：万象挪移
+        # 规则更改：
+        # - 每次释放时，选中第一名（当前第1名）的概率初始为 1%；
+        # - 若未选中第一名，则在其它位置目标中等概率选择；
+        # - 每次释放后，“选中第一名”的概率 +1%（上限100%），跨回合累计。
+        r = self.roles[12]
+        times = max(1, self.turn)
+        p_first = float(r.mem.get("wx_first_p", 0.01))
+        p_first = max(0.0, min(1.0, p_first))
+        self._log(f"  · 万象挪移：本回合连续释放 {times} 次（本回合起始选中第一名概率={p_first*100:.0f}%）")
         for k in range(times):
-            alive = self.alive_ids()
-            cand = [x for x in alive if x != 12]
-            if not cand:
-                self._log("  · 万象挪移：无可交换目标，后续施放停止")
+            alive_all = self.alive_ids()
+            pool = [x for x in alive_all if x != 12]
+            if not pool:
+                self._log("  · 万象挪移：无可交换目标，后续停止")
+                break
+            first = alive_all[0] if alive_all else None
+            # 先按概率尝试选中第一名（若第一名可被选中）
+            target = None
+            if first is not None and first in pool and self.rng.random() < p_first:
+                target = first
+            else:
+                others = [x for x in pool if x != first] if first in pool else pool[:]
+                target = self.rng.choice(others) if others else (first if first in pool else None)
+            # 每次释放后，选中第一名概率 +1%
+            p_first = min(1.0, p_first + 0.01)
+            r.mem["wx_first_p"] = p_first
+            if target is None:
                 return
-
-            target = self.rng.choice(cand)
-
-            # mls 被动免疫：若目标为mls则免疫并替换目标
-            # 注意：mls每回合只会触发一次免疫（由 mls_try_immune 的 this_turn 标记控制）
+            # mls 免疫处理
             if target == 10 and self.mls_try_immune(10, f"放烟花交换（第{k+1}次）"):
-                pool = [x for x in cand if x != 10]
-                if pool:
-                    target = self.rng.choice(pool)
-                else:
-                    self._log("  · 万象挪移：场上仅剩mls可选且其免疫触发 → 本次施放无效")
+                # 免疫触发后：从除mls以外的目标里重新等概率选一个（不再强制第一名）
+                pool2 = [x for x in pool if x != 10]
+                if not pool2:
+                    self._log("  · 万象挪移：仅剩mls且其免疫触发 → 本次无效")
                     continue
-
-            self._log(f"  · 万象挪移（第{k+1}次）：与 {self.N(target)} 交换")
-            self.swap(12, target, note=f"万象挪移第{k+1}次交换")
-
-        # ✅ 已移除：若上升得1临时盾 + 双生复制护盾
-
-    # 13 藕禄：祸福双生（发动时才绑定一次；之后只提示已绑定）
+                target = self.rng.choice(pool2)
+            self._log(f"  · 万象挪移（第{k+1}次）：与 {self.N(target)} 交换（释放后第一名概率已升至{p_first*100:.0f}%）")
+            self.swap(12, target, source=12, note=f"万象挪移第{k+1}次交换")
     def act_13(self):
-        # 发动时才进行一次双生绑定（只绑一次）
-        a, b = self.twin_pair
-        if b == -1:
-            alive = [cid for cid in self.alive_ids() if cid != 13]
-            if not alive:
-                self._log("  · 祸福双生：场上无可绑定目标")
-                return
-            partner = self.rng.choice(alive)
-            self.twin_pair = (13, partner)
-            self._log(f"  · 祸福双生：本回合绑定双生：藕禄(13) ↔ {self.N(partner)}")
-            return
+        # 藕禄：完全重做（移除全部双生相关内容）
+        # 【影入空濛】每回合若自己没有隐身，则获得隐身；若已有隐身，则移除隐身。
+        # 隐身状态：不会被任何技能选中（不包括世界规则）
+        before = self.roles[13].status.brief()
+        st = self.roles[13].status
+        if not st.invisible:
+            st.invisible = True
+            self._log("  · 影入空濛：获得【隐身】")
+        else:
+            st.invisible = False
+            self._log("  · 影入空濛：移除【隐身】")
+        self._oulu_bump_on_status_change(13, before)
 
-        self._log("  · 祸福双生：已绑定（被动生效中）")
 
-    # 14 郑孑健：无主动（护盾消耗斩人已在 kill 中；死亡复活在 on_death_14）
     def act_14(self):
-        self._log("  · 无主动技能（坚韧/血债在被动与死亡触发）")
-
-    # 15 施博理：高位清算（随机杀高位1，成功再杀1，上限2）
+        self._log("  · 无主动技能（死亡触发：血债血偿）")
     def act_15(self):
-        if self.roles[15].status.perma_disabled:
-            self._log("  · 高位清算：永久失效，无法发动")
-            return
         myr = self.rank_no(15)
         if myr is None or myr == 1:
             self._log("  · 高位清算：无高位目标")
             return
         higher = [x for x in self.alive_ids() if self.rank_no(x) is not None and self.rank_no(x) < myr]
-        t1 = self.rng.choice(higher)
+        if not higher:
+            self._log("  · 高位清算：无高位目标")
+            return
+        t1 = self.pick_random(15, higher, "高位清算第1杀目标")
+        if t1 is None:
+            return
         if self.is_mls_unselectable_by_active_kill(t1):
             self._log("  · 高位清算：随机到mls(10)不可选 → 失败")
             return
         self._log(f"  · 高位清算：斩杀 {self.N(t1)}")
         died = self.kill(t1, 15, "高位清算第1杀")
         if died:
-            higher2 = [x for x in self.alive_ids() if self.rank_no(x) is not None and self.rank_no(x) < self.rank_no(15)]
+            myr2 = self.rank_no(15)
+            if myr2 is None:
+                return
+            higher2 = []
+            for x in self.alive_ids():
+                rx = self.rank_no(x)
+                if rx is not None and rx < myr2:
+                    higher2.append(x)
             if higher2:
-                t2 = self.rng.choice(higher2)
-                if not self.is_mls_unselectable_by_active_kill(t2):
+                t2 = self.pick_random(15, higher2, "高位清算第2杀目标")
+                if t2 is not None and (not self.is_mls_unselectable_by_active_kill(t2)):
                     self._log(f"  · 追加清算：斩杀 {self.N(t2)}")
                     self.kill(t2, 15, "高位清算第2杀")
-
-    # 16 合议庭：众意审判（后60%触发：1与随机后60%交换；被审判者当回合技能无效）
+    # 5) 合议庭：删除“第一名本回合技能无效”
     def act_16(self):
         alive = self.alive_ids()
         myr = self.rank_no(16)
@@ -1312,12 +2194,12 @@ class Engine:
             return
         first = alive[0]
         tail = alive[int(len(alive) * 0.4):]
-        target = self.rng.choice([x for x in tail if x != first])
-        self._log(f"  · 众意审判：强制 {self.N(first)} 与 {self.N(target)} 交换；{self.N(first)} 本回合技能无效")
-        self.roles[first].mem["judged_this_turn"] = True
-        self.swap(first, target, note="众意审判交换")
-
-    # 17 路济阳：时空跃迁(每两回合) + 护佑之盾 + 时空斩击联动
+        target = self.pick_random(16, [x for x in tail if x != first], "众意审判交换目标")
+        if target is None:
+            return
+        self._log(f"  · 众意审判：强制 {self.N(first)} 与 {self.N(target)} 交换")
+        self.swap(first, target, source=16, note="众意审判交换")
+    # 7) 路济阳：移除“插到第一或最后→自杀”
     def act_17(self):
         r = self.roles[17]
         cd = r.mem.get("cd", 0)
@@ -1328,39 +2210,40 @@ class Engine:
         alive = self.alive_ids()
         oldr = self.rank_no(17)
         n = len(alive)
-
-        # 工程化：随机插入“空位”=选择一个插入排名位置 1..n
         new_rank = self.rng.randint(1, n)
-        self._log(f"  · 时空跃迁：插入第{new_rank}名位置（工程化解释：随机选择插入排名）")
-        if new_rank == 1 or new_rank == n:
-            self._log("  · 时空跃迁：插入最前/最后 → 自身死亡")
-            self.kill(17, None, "时空跃迁自杀", bypass_shield=False)
-            r.mem["cd"] = 2
-            return
-        self.insert_rank(17, new_rank, note="时空跃迁")
+        self._log(f"  · 时空跃迁：插入第{new_rank}名位置")
+        self.insert_rank(17, new_rank, source=17, note="时空跃迁")
 
-        # 护佑之盾：名单内随机两人加可持续护盾（perm）
-        whitelist = [17,14,16,7,6,20,11,19,22]
-        cand = [x for x in whitelist if self.roles[x].alive]
-        if len(cand) >= 2:
-            a, b = self.rng.sample(cand, 2)
-            self.give_shield(a, 1, perm=True, note="增益：护佑之盾(可持续)")
-            self.give_shield(b, 1, perm=True, note="增益：护佑之盾(可持续)")
+        # 护佑之盾：为随机两人生成可持续护盾（冷却5回合，且本局最多触发2次）
+        shield_cd = int(r.mem.get("shield_cd", 0))
+        if shield_cd > 0:
+            self._log(f"  · 护佑之盾：冷却中（剩余{shield_cd}回合）")
+        else:
+            uses = int(r.mem.get("shield_uses", 0))
+            if uses >= 2:
+                self._log("  · 护佑之盾：本局已使用2次 → 无法再触发")
+            else:
+                whitelist = [17, 14, 16, 7, 6, 20, 11, 19]
+                cand = [x for x in whitelist if x in self.roles and self.roles[x].alive]
+                if len(cand) >= 2:
+                    a, b = self.rng.sample(cand, 2)
+                    self.give_shield(a, 1, perm=True, note="增益：护佑之盾(可持续)")
+                    self.give_shield(b, 1, perm=True, note="增益：护佑之盾(可持续)")
+                    r.mem["shield_cd"] = 5
+                    r.mem["shield_uses"] = uses + 1
 
-        # 时空斩击：若跃迁后自身排名下降，则随机斩杀跃迁前高于自己的角色
         nowr = self.rank_no(17)
         if oldr is not None and nowr is not None and nowr > oldr:
             higher_before = [x for x in alive if self.rank_no(x) is not None and self.rank_no(x) < oldr and x != 17]
             if higher_before:
-                t = self.rng.choice(higher_before)
-                if not self.is_mls_unselectable_by_active_kill(t):
-                    self._log(f"  · 时空斩击：跃迁后下降，斩杀跃迁前高位 {self.N(t)}")
-                    self.kill(t, 17, "时空斩击联动斩杀")
-                else:
-                    self._log("  · 时空斩击：随机到mls(10)不可选 → 失败")
+                t = self.pick_random(17, higher_before, "时空斩击目标")
+                if t is not None:
+                    if not self.is_mls_unselectable_by_active_kill(t):
+                        self._log(f"  · 时空斩击：跃迁后下降，斩杀跃迁前高位 {self.N(t)}")
+                        self.kill(t, 17, "时空斩击联动斩杀")
+                    else:
+                        self._log("  · 时空斩击：随机到mls(10)不可选 → 失败")
         r.mem["cd"] = 2
-
-    # 18 更西部：秩序颠覆(每两回合：1与随机后50%交换) + 末位放逐联动
     def act_18(self):
         r = self.roles[18]
         cd = r.mem.get("cd", 0)
@@ -1370,31 +2253,28 @@ class Engine:
             return
         alive = self.alive_ids()
         first = alive[0]
-        back = alive[len(alive)//2:]
-        target = self.rng.choice([x for x in back if x != first])
+        back = alive[len(alive) // 2:]
+        target = self.pick_random(18, [x for x in back if x != first], "秩序颠覆交换目标")
+        if target is None:
+            return
         self._log(f"  · 秩序颠覆：交换 {self.N(first)} 与 {self.N(target)}")
-        self.swap(first, target, note="秩序颠覆")
-        # 末位放逐：当交换成功后，若自身排名>10且有护盾，则可消耗1盾斩杀被换下来的原第一
+        self.swap(first, target, source=18, note="秩序颠覆")
         myr = self.rank_no(18)
         if myr is not None and myr > 10 and self.roles[18].status.total_shields() > 0:
             self.consume_shield_once(18)
             self._log(f"  · 末位放逐：消耗1层护盾，斩杀原第一 {self.N(first)}")
             self.kill(first, 18, "末位放逐联动斩杀")
         r.mem["cd"] = 2
-
-    # 19 释延能：万象随机（50%复制其他角色主动技能）
     def act_19(self):
-        if self.rng.random() >= 0.5:
-            self._log("  · 万象随机：50%判定失败，无事发生")
-            return
+        # 释延能(19)
+        # 改动：每回合必定释放（概率100%），随机复制一名存活角色的主动逻辑并执行。
         pool = [i for i in self.alive_ids() if i != 19]
-        # 工程化：只复制“有主动函数”的角色（1..26都有函数，但部分是“无主动”）
-        pick = self.rng.choice(pool)
+        pick = self.pick_random(19, pool, "万象随机复制对象")
+        if pick is None:
+            self._log("  · 万象随机：无可复制目标")
+            return
         self._log(f"  · 万象随机：复制 {self.N(pick)} 的主动逻辑（以释延能触发）")
-        # 工程化：直接调用对应角色的 act_XX（效果由“技能本身”决定）
         self.dispatch_active(pick)
-
-    # 20 豆进天之父：父子同心·改（豆进天存活主动斩杀概率；豆进天死后被动见世界规则）
     def act_20(self):
         if not self.roles[11].alive:
             self._log("  · 父子同心：豆进天已死，本回合无主动（转被动）")
@@ -1410,7 +2290,9 @@ class Engine:
         if not lower:
             self._log("  · 父子同心：无低位目标")
             return
-        t = self.rng.choice(lower)
+        t = self.pick_random(20, lower, "父子同心斩杀目标")
+        if t is None:
+            return
         if self.is_mls_unselectable_by_active_kill(t):
             self._log("  · 父子同心：随机到mls(10)不可选 → 失败")
             return
@@ -1420,44 +2302,27 @@ class Engine:
             self._log(f"  · 父子同心：成功率{int(p*100)}%判定成功，斩杀 {self.N(t)} 并与豆进天交换")
             self.kill(t, 20, "父子同心斩杀")
             if self.roles[11].alive:
-                self.swap(20, 11, note="父子同心成功后交换")
+                self.swap(20, 11, source=20, note="父子同心成功后交换")
         else:
             self._log(f"  · 父子同心：成功率{int(p*100)}%判定失败")
-
-    # 21 钟无艳：往事皆尘（每3回合）遗忘1回合；下回合无法获得护盾（孤傲增益免疫已在 give_shield）
+    # 4) 钟无艳：删除孤傲/禁盾；仅保留“每3回合遗忘1回合”
     def act_21(self):
         r = self.roles[21]
         r.mem["counter"] = r.mem.get("counter", 0) + 1
         if r.mem["counter"] % 3 != 0:
             self._log("  · 往事皆尘：计数未到（每3回合）")
             return
-        alive = self.alive_ids()
-        target = self.rng.choice([x for x in alive if x != 21])
-        # 对已受遗忘/封印目标无效
+        alive = [x for x in self.alive_ids() if x != 21]
+        target = self.pick_random(21, alive, "往事皆尘目标")
+        if target is None:
+            return
         if self.roles[target].status.sealed > 0 or self.roles[target].status.forgotten > 0:
             self._log("  · 往事皆尘：目标已封印/遗忘，无效")
             return
+        before_t = self.roles[target].status.brief()
         self.roles[target].status.forgotten = max(self.roles[target].status.forgotten, 1)
+        self._oulu_bump_on_status_change(target, before_t)
         self._log(f"  · 往事皆尘：{self.N(target)} 遗忘主动技能1回合")
-        self.roles[21].status.cant_gain_shield_next = 1
-        self.twin_share_nonkill(target, "forget")
-
-    # 22 众议院：冷静客观（每两回合）挡刀一次 + 可立即交换
-    def act_22(self):
-        r = self.roles[22]
-        cd = r.mem.get("cd", 0)
-        if cd > 0:
-            r.mem["cd"] = cd - 1
-            self._log("  · 冷静客观：冷却中")
-            return
-        alive = self.alive_ids()
-        target = self.rng.choice([x for x in alive if x != 22])
-        self.roles[22].status.guard_for = target
-        self._log(f"  · 冷静客观：为 {self.N(target)} 挡刀一次，并立即交换")
-        self.swap(22, target, note="冷静客观交换")
-        r.mem["cd"] = 2
-
-    # 23 梅雨神：久旱逢甘霖（每两回合）斩杀连续存活≥2回合角色；死亡复活“死亡超过3回合”的人
     def act_23(self):
         r = self.roles[23]
         cd = r.mem.get("cd", 0)
@@ -1465,12 +2330,10 @@ class Engine:
             r.mem["cd"] = cd - 1
             self._log("  · 久旱逢甘霖：冷却中")
             return
-        # 工程化：用 mem["alive_turns"] 统计连续存活回合（在 step_update_and_cleanup 里不做；这里简化：turn>=2视为满足，且被杀后重置）
         cand = []
         for cid in self.alive_ids():
             if cid == 23:
                 continue
-            # 连续存活≥2：工程化：cid.mem["alive_turns"]>=2
             t = self.roles[cid].mem.get("alive_turns", 0)
             if t >= 2:
                 cand.append(cid)
@@ -1478,15 +2341,15 @@ class Engine:
             self._log("  · 久旱逢甘霖：无连续存活≥2目标")
             r.mem["cd"] = 2
             return
-        target = self.rng.choice(cand)
+        target = self.pick_random(23, cand, "久旱逢甘霖目标")
+        if target is None:
+            return
         if self.is_mls_unselectable_by_active_kill(target):
             self._log("  · 久旱逢甘霖：随机到mls(10)不可选 → 失败")
         else:
             self._log(f"  · 久旱逢甘霖：斩杀 {self.N(target)}")
             self.kill(target, 23, "久旱逢甘霖随机斩杀")
         r.mem["cd"] = 2
-
-    # 24 左右脑：混乱更换（每两回合）使两名其他角色互换（不含自己）
     def act_24(self):
         r = self.roles[24]
         cd = r.mem.get("cd", 0)
@@ -1500,144 +2363,404 @@ class Engine:
             return
         a, b = self.rng.sample(cand, 2)
         self._log(f"  · 混乱更换：{self.N(a)} 与 {self.N(b)} 互换")
-        self.swap(a, b, note="混乱更换")
+        self.swap(a, b, source=24, note="混乱更换")
         r.mem["cd"] = 2
-
-    # 25 找自称：无主动技能（祝福为被动叠加）
     def act_25(self):
-        self._log("  · 无主动技能（祝福为被动叠加）")
+        # Default: no active skill (blessings are handled in passives).
+        if not self.joke_mode:
+            self._log("  · 无主动技能（祝福为被动叠加）")
+            return
+        # Joke mode: invincible + 10 times per turn: eliminate a random role, then move up 1.
+        self._log("  · 找自称(25) 无敌：获得护盾99999疫一切）")
+        try:
+            self.roles[25].status.__dict__["fake_99999"] = True
+        except Exception:
+            pass
+        npc_ids = {getattr(self, "HW_CID", 1001), getattr(self, "LDL_CID", 1002)}
+        for i in range(10):
+            targets = [cid for cid in self.alive_ids() if cid != 25 and cid not in npc_ids]
+            if not targets:
+                break
+            v = self.rng.choice(targets)
+            self._log(f"    - 第{i+1}次：随机淘汰 {self.N(v)}")
+            # Direct elimination (bypass shields & revival) to match the joke-mode description.
+            self.kill(v, 25, "玩笑模式随机淘汰", bypass_shield=True, bypass_revive=True)
+            # After each trigger, rise 1 position.
+            self.move_by(25, -1)
 
 
-    # 26 Sunnydayorange：第4回合触发【自我放逐】（自己移除自己）
     def act_26(self):
-        if self.turn == 4:
-            self._log("  · 【自我放逐】：Sunnydayorange(26) 自己移除自己")
-            # 自我放逐：视为死亡（无击败者），无视挡刀；护盾是否可挡你没写，这里按“直接移除”=护盾无效
-            self.kill(26, None, "自我放逐", bypass_shield=True, bypass_guard=True)
+        if self.turn == 6:
+            self._log("  · 【自我放逐】：Sunnydayorange(26) 自己移除自己（第6回合）")
+            self.kill(26, None, "自我放逐", bypass_shield=True, bypass_revive=True)
         else:
-            self._log("  · 无主动技能（仅第4回合触发【自我放逐】）")
-
-    # 10/11/13/14 等无主动已实现；但还有缺的：6/10/11/13/14 已覆盖；18/23/24/26 已覆盖
-
+            self._log("  · 无主动技能（仅第6回合触发【自我放逐】）")
     # =========================
-    # 其他角色主动：补齐缺口（已覆盖所有cid 1..26）
-    # 这里只剩：10/11/13/14 已是无主动
+    # 死亡触发
     # =========================
-
-    # =========================
-    # 死亡触发：2/5/7/9/14/23/26
-    # =========================
-
-    def on_death_2(self):
-        # 潘乐一死亡：清空全场霜冻
-        cleared = 0
-        for cid, r in self.roles.items():
-            if r.status.frost:
-                r.status.frost = False
-                cleared += 1
-        if cleared > 0:
-            self._log(f"  · 潘乐一(2) 被击败：全场【霜冻】效果消失（清除{cleared}个）")
-        else:
-            self._log("  · 潘乐一(2) 被击败：场上无霜冻可清除")
-
-
     def on_death_7(self, killer: Optional[int]):
-        if killer is None:
+        if killer is None or killer not in self.roles or (not self.roles[killer].alive):
             self._log("  · hewenx怨念爆发：无有效凶手")
             return
-        if not self.roles.get(killer) or not self.roles[killer].alive:
-            self._log("  · hewenx怨念爆发：凶手不存活/无效")
-            return
-        # 阈值：hewenx死亡时排名（工程化：取其在rank里当时的位置；死亡后已移除，所以用 start_rank_snapshot 或记录死前rank）
         threshold = self.start_rank_snapshot.get(7, 999)
         self.roles[killer].status.hewenx_curse = {"killer": killer, "threshold_rank": threshold}
         self._log(f"  · hewenx怨念爆发：标记凶手 {self.N(killer)}，下回合行动前若排名高于阈值则斩杀（护盾无效）")
-
     def on_death_9(self):
-        # 墨守·改：遗策(随机一人永久失效) + 留痕(随机一人下次目标随机)
+        # 书法家(9) 的死亡触发已改为“立刻复活并获得永久遗策直插第一（本局一次）”，
+        # 因此此处不再执行旧版“遗策/留痕”随机效果。
+        return
+    def on_death_14(self, killer: Optional[int]):
+        """郑孑健(14)【血债血偿】：首次被淘汰时复活，并反杀击杀者。"""
+        if 14 not in self.roles:
+            return
+        r = self.roles[14]
+        st = r.status
+        if st.perma_disabled:
+            return
+        if r.mem.get("revive_used"):
+            self._log("  · 血债血偿：已用过，本次不触发")
+            return
+
+        # 触发一次性复活
+        r.mem["revive_used"] = True
+        r.alive = True
+        self._log(f"  · 【血债血偿】{self.N(14)} 首次被淘汰时复活")
+
+        # 反杀凶手
+        if killer is None or killer not in self.roles or (not self.roles[killer].alive):
+            self._log("    ↳ 无有效存活凶手，不触发反杀")
+        else:
+            self._log(f"    ↳ 反杀 {self.N(killer)}")
+            self.kill(14, killer, "血债血偿反杀")
+
+        # 复活后移到队尾并整理
+        if 14 in self.rank:
+            self.rank.remove(14)
+        self.rank.append(14)
+        self._compact()
+
+    def act_27(self):
+        # 黄伶俐(27)
+        # 【穷追猛打】每两回合发动：随机淘汰一人，记录双方排名，
+        # 随后自己上升“排名差值”（按绝对差计算）。
+        if self.turn % 2 != 0:
+            self._log("  · 穷追猛打：未到发动回合（每两回合）")
+            return
+        myr = self.rank_no(27)
+        if myr is None:
+            return
+        pool = [cid for cid in self.alive_ids() if cid != 27 and cid != 10]  # mls(10) 不可被主动淘汰
+        if not pool:
+            self._log("  · 穷追猛打：无可淘汰目标")
+            return
+        target = self.pick_random(27, pool, "穷追猛打淘汰目标")
+        if target is None:
+            return
+        tr = self.rank_no(target)
+        if tr is None:
+            return
+        self._log(f"  · 穷追猛打：随机淘汰 {self.N(target)}（我={myr}名，目标={tr}名）")
+        died = self.kill(target, 27, "穷追猛打淘汰")
+        if not died:
+            self._log("  · 穷追猛打：淘汰被抵挡（护盾）→ 不进行位移")
+            return
+        diff = abs(tr - myr)
+        if diff > 0:
+            self._log(f"  · 穷追猛打：上升排名差值 {diff} 名")
+            self.move_by(27, -diff, source=27, note="穷追猛打位移")
+
+
+    def act_29(self):
+        # 严雅(29) 净化能量：在其释放主动技能时触发（不再在回合结束触发）。
+        # 行为：若不在冷却，则对自己及相邻（排名前后各1）存活者施加【净化】2回合。
+        # 冷却：purify_cd > 0 时本回合不释放，并在每次释放阶段 cd-1。
+        if (not self.roles[29].alive) or self.roles[29].status.perma_disabled:
+            return
+
+        cd = int(self.roles[29].mem.get("purify_cd", 0))
+        if cd > 0:
+            self.roles[29].mem["purify_cd"] = cd - 1
+            self._log(f"  · 净化能量：冷却中({cd-1})")
+            return
+
+        p = self.pos(29)
+        targets = []
+        if p is not None:
+            for q in (p - 1, p, p + 1):
+                if 0 <= q < len(self.rank):
+                    t = self.rank[q]
+                    if self.roles[t].alive:
+                        targets.append(t)
+
+        if targets:
+            for t in targets:
+                before_t = self.roles[t].status.brief()
+                self.roles[t].status.purify_ttl = max(getattr(self.roles[t].status, "purify_ttl", 0), 2)
+                self._on_status_change(t, before_t)
+            self._log("  · 净化能量：" + "、".join(self.N(x) for x in targets) + " 获得【净化】(2回合)")
+
+    def act_34(self):
+        # 季任杰(34)
+        # 【越挫越勇】被动：在回合末结算（见 step_update_and_cleanup）
+        self._log("  · 无主动技能（被动：越挫越勇在回合末结算）")
+
+
+    def act_36(self):
+        # 施禹谦(36) 无主动技能；被动在回合末判定【天罚灭世】与回合初【神威】处决
+        self._log("  · 无主动技能（被动：天罚灭世/神威）")
+
+    def act_38(self):
+        # 陆泽灏(38)
+        # 【翩若惊鸿】每回合有5%概率立刻升至第一名。
+        # 若判定失败，则下一回合概率上升5%（可叠加），最高80%。
+        r = self.roles[38]
+        p = float(r.mem.get("pyjh_p", 0.05))
+        p = max(0.05, min(0.80, p))
+        if self.rng.random() < p:
+            self._log(f"  · 翩若惊鸿：{int(p*100)}% 判定成功 → 立刻升至第一名")
+            self.insert_rank(38, 1, source=38, note="翩若惊鸿")
+            r.mem["pyjh_p"] = 0.05
+        else:
+            p2 = min(0.80, p + 0.05)
+            r.mem["pyjh_p"] = p2
+            self._log(f"  · 翩若惊鸿：{int(p*100)}% 判定失败 → 下回合概率提升至{int(p2*100)}%")
+
+    def act_40(self):
+        # 姚舒馨(40)
+        # 【烈焰炸弹】若场上不存在炸弹：随机一人获得炸弹（红色状态）。
+        # 若场上存在炸弹：引爆，持有者被姚舒馨淘汰；若其排名高于姚舒馨，则姚舒馨代替其位置。
         alive = self.alive_ids()
         if not alive:
             return
-        a = self.rng.choice(alive)
-        self.roles[a].status.perma_disabled = True
-        self._log(f"  · 遗策：{self.N(a)} 本局技能永久失效")
-        alive2 = [x for x in self.alive_ids() if x != a]
-        if alive2:
-            b = self.rng.choice(alive2)
-            self.roles[b].status.next_target_random = True
-            self._log(f"  · 留痕：{self.N(b)} 下次技能目标变为随机")
+        holders = [cid for cid in alive if self.roles[cid].status.bomb]
+        if not holders:
+            pool = [cid for cid in alive if cid != 40]
+            if not pool:
+                self._log("  · 烈焰炸弹：无可生成目标")
+                return
+            target = self.pick_random(40, pool, "烈焰炸弹投放目标")
+            if target is None:
+                self._log("  · 烈焰炸弹：未选中目标（可能全体隐身/不可选）")
+                return
+            before = self.roles[target].status.brief()
+            self.roles[target].status.bomb = True
+            self._log(f"  · 烈焰炸弹：{self.N(target)} 获得【炸弹】")
+            self._on_status_change(target, before)
+            return
 
-    def on_death_14(self, killer: Optional[int]):
-        # 血债血偿：死亡时复活并杀死凶手，取代其位置，获得护盾（每局一次）
-        st = self.roles[14].status
-        if st.perma_disabled:
+        holder = holders[0]
+        holder_rank = self.rank_no(holder)
+        my_rank = self.rank_no(40)
+        if holder_rank is None or my_rank is None:
             return
-        if self.roles[14].mem.get("revive_used"):
-            self._log("  · 血债血偿：已用过，本次不触发")
+
+        self._log(f"  · 烈焰炸弹：引爆 {self.N(holder)} 的炸弹")
+        died = self.kill(holder, 40, "烈焰炸弹引爆淘汰")
+        # 无论是否淘汰成功（护盾/免疫等），炸弹都会消失
+        before_b = self.roles[holder].status.brief()
+        self.roles[holder].status.bomb = False
+        self._on_status_change(holder, before_b)
+        if not died:
+            # 护盾抵挡也应消耗炸弹（修复：炸弹不应继续留场）
+            self._log("  · 烈焰炸弹：淘汰被抵挡（护盾）→ 炸弹消失")
             return
-        if killer is None or not self.roles.get(killer) or not self.roles[killer].alive:
-            self._log("  · 血债血偿：无有效存活凶手，不触发")
+
+        if holder_rank < my_rank and self.roles[40].alive:
+            self._compact()
+            self._log(f"  · 烈焰炸弹：目标原排名更高 → {self.N(40)} 代替其位置（第{holder_rank}名）")
+            self.insert_rank(40, holder_rank, source=None, note="烈焰炸弹代替位置")
+
+    def act_41(self):
+        # 张志成（41）【迫近战线】主动，冷却2回合
+        if not self.roles[41].alive or self.roles[41].status.perma_disabled:
             return
+        st = self.roles[41].status
+        if getattr(st, "frontline_cd", 0) > 0:
+            return
+        r41 = self.rank_no(41)
+        if r41 is None:
+            return
+        cand = []
+        for x in self.alive_ids():
+            if x == 41:
+                continue
+            rx = self.rank_no(x)
+            if rx is not None and rx < r41:
+                cand.append(x)
+        if not cand:
+            return
+        t = self.rng.choice(cand)
+        if 41 not in self._active_logged:
+            self._active_logged.add(41)
+            self._log(f"【{self.N(41)}】发动主动技能…")
+        self._log(f"  · 迫近战线：选择 {self.N(t)}，双方互相逼近1名")
+        # 自己上升1，目标下降1
+        self.move_by(41, -1, source=41, note="迫近战线")
+        self.move_by(t, 1, source=41, note="迫近战线")
+        st.frontline_cd = 2
+
+    def act_33(self):
+        # 沈澄婕：无主动技能（仅被动【特异性免疫】）
+        self._log("  · 无主动技能（被动：特异性免疫）")
+
+
+    def act_39(self):
+        # 朱诚
+        # 【导电性】（主动）转移自身雷霆层数给随机一名排名高于自身的角色；成功则获得1层感电，叠满3后每回合消耗1层并上升3名
+        if not self.roles[39].alive or self.roles[39].status.perma_disabled:
+            return
+        st = self.roles[39].status
+        if st.thunder <= 0:
+            self._log("  · 导电性：自身无雷霆可转移")
+            return
+        my_rank = self.rank_no(39)
+        if my_rank is None:
+            return
+        higher = [cid for cid in self.alive_ids() if (self.rank_no(cid) is not None and self.rank_no(cid) < my_rank)]
+        if not higher:
+            self._log("  · 导电性：无排名高于自身的目标")
+            return
+        target = self.pick_random(39, higher, "导电性转移目标")
+        if target is None:
+            self._log("  · 导电性：未选中目标（可能全体隐身/不可选）")
+            return
+        before_t = self.roles[target].status.brief()
+        trans = st.thunder
+        st.thunder = 0
+        self.roles[target].status.thunder += trans
+        self._on_status_change(target, before_t)
+        self._log(f"  · 导电性：转移雷霆{trans}层 → {self.N(target)}")
+        # 获得感电
+        st.dian = min(3, getattr(st, "dian", 0) + 1)
+        self._log(f"  · 导电性：{self.N(39)} 获得1层【感电】(当前{st.dian}/3)")
+
+    def act_42(self):
+        # 俞守衡
+        # 【鱼龙潜跃】若场上不存在鱼，则随机为一个角色施加一个“鱼”（蓝色）
+        # 【游鱼归渊】鱼每回合将附身者以及相邻角色向下拖一个名次；俞守衡自己不受影响
+        alive = self.alive_ids()
+        if not alive:
+            return
+
+        fish_exists = any(self.roles[cid].alive and self.roles[cid].status.fish for cid in self.roles)
+        if not fish_exists:
+            pool = [cid for cid in alive if cid != 42]
+            if not pool:
+                self._log("  · 鱼龙潜跃：无可施加目标")
+            else:
+                target = self.pick_random(42, pool, "鱼龙潜跃施加目标")
+                if target is None:
+                    self._log("  · 鱼龙潜跃：未选中目标（可能全体隐身/不可选）")
+                else:
+                    self.set_status(target, "fish", True, 42, note="鱼龙潜跃")
+                    self._log(f"  · 鱼龙潜跃：{self.N(target)} 获得【鱼】")
+
+        # 游鱼归渊：取场上第一条鱼的附身者（规则：场上至多1条鱼）
+        alive_now = self.alive_ids()
+        holders = [cid for cid in alive_now if self.roles[cid].status.fish]
+        if not holders:
+            self._log("  · 游鱼归渊：场上无鱼")
+            return
+
+        holder = holders[0]
+        p = self.pos(holder)
+        if p is None:
+            return
+
+        affected = []
+        for q in (p - 1, p, p + 1):
+            if 0 <= q < len(self.rank):
+                c = self.rank[q]
+                if self.roles[c].alive and c != 42:
+                    affected.append(c)
+
+        seen = set()
+        affected = [x for x in affected if not (x in seen or seen.add(x))]
+        if not affected:
+            self._log("  · 游鱼归渊：无受影响目标")
+            return
+
+        self._log("  · 游鱼归渊：鱼 牵引  " + "、".join(self.N(x) for x in affected) + " 下移1位")
+        # 同步位移：从后往前移动，避免先移动导致相互抵消
+        affected_sorted = sorted(affected, key=lambda x: self.rank_no(x) or 0, reverse=True)
+        for c in affected_sorted:
+            self.move_by(c, +1, source=42, note="游鱼归渊")
+
+    def act_46(self):
+        # 戚银潞：第一回合标记两名队友（仅日志记录）
+        r = self.roles[46]
+        if self.turn == 1 and (not r.mem.get("mates_picked", False)):
+            pool = [cid for cid in self.alive_ids() if cid != 46]
+            if len(pool) >= 2:
+                a, b = self.rng.sample(pool, 2)
+                r.mem["mates_picked"] = True
+                r.mem["mates"] = [a, b]
+                self._log(f"  · 孤军奋战：队友标记为 {self.N(a)}、{self.N(b)}（仅记录）")
+        # 主动无额外效果
+        return
+
+        if not any(self.roles[cid].alive and self.roles[cid].status.fish for cid in self.roles):
+            pool = [cid for cid in alive if cid != 42]
+            if pool:
+                target = self.pick_random(42, pool, "鱼龙潜跃施加目标")
+                if target is not None:
+                    self.set_status(target, 'fish', True, 42, note='鱼龙潜跃')
+                    self._log(f"  · 鱼龙潜跃：{self.N(target)} 获得【鱼】")
+
+        # 【游鱼归渊】鱼每回合牵引附身者及相邻者下拖一位；俞守衡自己不受影响
+        alive_now = self.alive_ids()
+        holders = [cid for cid in alive_now if self.roles[cid].status.fish]
+        if holders:
+            holder = holders[0]
+            p = self.pos(holder)
+            if p is not None:
+                affected = []
+                for q in (p-1, p, p+1):
+                    if 0 <= q < len(self.rank):
+                        c = self.rank[q]
+                        if self.roles[c].alive and c != 42:
+                            affected.append(c)
+                # 去重
+                seen=set()
+                affected=[x for x in affected if not (x in seen or seen.add(x))]
+                if affected:
+                    self._log("  · 游鱼归渊：鱼 牵引  " + "、".join(self.N(x) for x in affected) + " 下移1位")
+                    for c in affected:
+                        self.move_by(c, +1, source=42, note="游鱼归渊")
+
         self.roles[14].mem["revive_used"] = True
-
-        # 复活
         self.roles[14].alive = True
-        self._log(f"  · 血债血偿：{self.N(14)} 复活并杀死凶手 {self.N(killer)}，取代其位置并获得护盾")
-        # 反杀凶手（无视护盾？原文没写无视，这里按普通斩杀，可被护盾挡；如需无视改 bypass_shield=True）
-        self.kill(killer, 14, "血债血偿反杀凶手", bypass_shield=False)
+        self._log(f"  · 血债血偿：{self.N(14)} 复活并杀死凶手 {self.N(killer)}")
 
-        # 取代位置：工程化做法：把14插入到凶手原位置（若凶手没死则不替换）
+        self.kill(killer, 14, "血债血偿反杀凶手", bypass_shield=False, bypass_revive=True)
+
+        # 复活后必定在最后一名
         self._compact()
-        pk = self.pos(killer)
-        if pk is not None and not self.roles[killer].alive:
-            # killer还在rank里但标死会被compact移除，这里尽力插到 pk+1
-            self.rank.insert(min(pk, len(self.rank)), 14)
+        if self.roles[14].alive:
+            # 确保 rank 中只有一个 14
+            self.rank = [cid for cid in self.rank if cid != 14]
+            self.rank.append(14)
         self._compact()
-        self.give_shield(14, 1, perm=True, note="血债血偿护盾(可持续)")
+
 
     def on_death_23(self):
-        # 死亡时自动复活一个死亡状态超过三回合的角色
-        # 工程化：用 role.mem["dead_turn"] 记录死亡回合，若当前turn - dead_turn > 3 可复活
         cand = []
         for cid, r in self.roles.items():
             if cid == 23:
                 continue
-            if not r.alive and ("dead_turn" in r.mem) and (self.turn - r.mem["dead_turn"] > 3):
+            if (not r.alive) and ("dead_turn" in r.mem) and (self.turn - r.mem["dead_turn"] > 3):
                 cand.append(cid)
         if cand:
             t = self.rng.choice(cand)
             self.roles[t].alive = True
             self._log(f"  · 梅雨神死亡被动：复活 {self.N(t)}（死亡超过3回合）")
-            # 复活后放到中位
             self._compact()
-            mid = max(1, len(self.rank)//2 + 1)
-            self.rank.insert(mid-1, t)
+            mid = max(1, len(self.rank) // 2 + 1)
+            self.rank.insert(mid - 1, t)
             self._compact()
-
-    def on_death_5(self):
-        # 王者替身：死亡时，若施沁皓存活且有护盾，则死亡效果转移给施沁皓，姚宇涛复活升至第一（每局一次）
-        st = self.roles[5].status
-        if st.perma_disabled:
-            return
-        if st.yao_substitute_used:
-            return
-        if self.roles[3].alive and self.roles[3].status.total_shields() > 0:
-            st.yao_substitute_used = True
-            # 消耗施沁皓一层护盾并让其承受“死亡效果转移”（工程化：直接斩杀施沁皓一次，护盾可挡已满足有盾）
-            self._log("  · 王者替身：满足条件，死亡效果转移给施沁皓(3)，姚宇涛复活并升至第一（每局一次）")
-            self.kill(3, 5, "王者替身转移死亡")
-            # 复活姚宇涛并置顶
-            self.roles[5].alive = True
-            self._compact()
-            if 5 not in self.rank:
-                self.rank.insert(0, 5)
-            else:
-                self.insert_rank(5, 1, note="王者替身置顶")
-
     # =========================
-    # 每回合存活计数（给梅雨神/连续存活判定用）
+    # 回合存活计数
     # =========================
-
     def tick_alive_turns(self):
         for cid, r in self.roles.items():
             if r.alive:
@@ -1645,491 +2768,1037 @@ class Engine:
             else:
                 if "dead_turn" not in r.mem:
                     r.mem["dead_turn"] = self.turn
-
-
+    # ---------- 批量模拟 ----------
+    def play_to_end(self, max_turns: int = 5000) -> Optional[int]:
+        for _ in range(max_turns):
+            if self.game_over:
+                alive = self.alive_ids()
+                return alive[0] if len(alive) == 1 else None
+            if not self.alive_ids():
+                return None
+            try:
+                self.tick_alive_turns()
+                self.next_turn()
+            except Exception:
+                return None
+        return None
 # =========================
 # UI
 # =========================
-if TK_AVAILABLE:
-    class UI:
-        def __init__(self, root: tk.Tk):
-            self.root = root
-            self.root.title("神秘游戏 made by dian_mi")
-            self.root.geometry("1100x720")
+class UI:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("神秘游戏 made by dian_mi")
+        self.root.geometry("1100x720")
+        self.engine = Engine(seed=None)
+        # 播放/回放状态
+        self.play_cursor = 0
+        self.playing = False
+        self._play_job = None  # after() job id for auto-play (avoid stacking)
+        self.speed_var = tk.DoubleVar(value=0.25)
+        # 显示历史（右侧日志与逐行回放）
+        self.preserve_history = tk.BooleanVar(value=True)
+        self.show_realname = tk.BooleanVar(value=False)
+        self.show_initials = tk.BooleanVar(value=False)
+        self.auto_skip_turn = tk.BooleanVar(value=True)
+        self.export_error_log = False
+        self._auto_skip_job: Optional[str] = None
+        # Joke mode: "找自称无敌模式" (default off)
+        self.joke_mode = tk.BooleanVar(value=False)
+        self.revealed_lines: List[str] = []
+        self.revealed_hls: List[List[int]] = []
+        self.revealed_victims: List[Optional[int]] = []
+        self.current_snap = None
+        self.current_highlights: set[int] = set()
+        self.font_size = 16
+        self.font_rank = tkfont.Font(family="Microsoft YaHei UI", size=self.font_size, weight="normal")
+        self.font_log = tkfont.Font(family="Microsoft YaHei UI", size=self.font_size, weight="normal")
+        self.font_log_bold = tkfont.Font(family="Microsoft YaHei UI", size=self.font_size, weight="bold")
+        self._cid_pat = re.compile(r"\((\d{1,3})\)")
+        # 颜色
+        self.color_thunder = "#0B3D91"
+        self.color_pos = "#D4AF37"
+        self.color_neg = "#E53935"
+        self.color_purple = "#8E44AD"
+        self.NPC_NAME_COLOR = {1001: "#D4AF37", 1002: "#D4AF37", 901: "#D4AF37", 902: "#1E40AF"}
+        # 显示实名：仅改名字，不改机制、不改编号
+        self.REALNAME_MAP = {
+            "更西部": "高鑫博",
+            "Sunnydayorange": "秦添城",
+            "施博理": "施博文",
+            "释延能": "邵煜楠",
+            "牵寒": "黄芊涵",
+            "mls": "孟真",
+            "放烟花": "范雨涵",
+            "合议庭": "黄煜婷",
+            "藕禄": "欧鹭",
+            "梅雨神": "董玫妤",
+            "豆进天之父": "胡喆",
+            "钟无艳": "章文元",
+            "hewenx": "何文馨",
+            "豆进天": "窦竞天",
+            "书法家": "孙凡珺",
+            "路济阳": "陆嘉翊",
+            "增进舒": "曾靖舒",
+            "找自称": "赵梓琛",
+            "郑孑健": "郑子健",
+            "左右脑": "甄艺诺",
+        }
 
-            # --- 一定要初始化这些 ---
-            self.engine = Engine(seed=None)
-
-            self.rank_row_widgets = {}
-            self.rank_rows = []          # 行池：[{frame,name_lbl,tags_frame}, ...]
-            self.row_cid_map = {}        # cid -> 行控件(frame)，供高亮/清除用
-            self.prev_highlights = set()
-
-            self.play_cursor = 0
-            self.playing = False
-            self.speed_var = tk.DoubleVar(value=0.25)
-
-            self.revealed_lines = []
-            self.revealed_hls = []
-            self.revealed_victims = []
-            self.current_snap = None
-            self.current_highlights = set()
-            self._flash_job = None
-
-            # 字体
-            self.font_rank = tkfont.Font(family="Microsoft YaHei UI", size=15, weight="normal")
-            self.font_log  = tkfont.Font(family="Microsoft YaHei UI", size=14, weight="normal")
-            self.font_log_bold = tkfont.Font(family="Microsoft YaHei UI", size=14, weight="bold")
-
-            self._cid_pat = re.compile(r"\((\d{1,2})\)")
-
-            self.color_thunder = "#0B3D91"  # 深蓝：雷霆
-            self.color_frost   = "#7EC8FF"  # 浅蓝：霜冻
-            self.color_pos     = "#D4AF37"
-            self.color_neg     = "#E53935"
-            self.color_purple  = "#8E44AD"
-            self.pos_keywords = ("护盾", "祝福")
-            self.neg_keywords = ("雷霆", "霜冻", "封印", "遗忘", "遗策", "黄昏", "留痕", "厄运", "禁盾", "集火", "孤傲")
-
-            # --- 关键：必须 build + refresh ---
-            self._build()
-            self.refresh()
-
-        def _set_game_over_buttons(self):
-            # 结束局：禁止继续推进/播放，只留新开局
+        self.INITIALS_MAP = {
+            "朱昊泽": "zhz",
+            "蒋骐键": "jqj",
+            "李知雨": "lzy",
+            "朱诚": "zc",
+            "邵煜楠": "syn",
+            "陈心如": "cxr",
+            "俞守衡": "ysh",
+            "施禹谦": "syq",
+            "虞劲枫": "yjf",
+            "范一诺": "fyn",
+            "孙凡珺": "sfj",
+            "严雅": "yy",
+            "陆嘉翊": "ljy",
+            "甄艺诺": "zyn",
+            "黄煜婷": "hyt",
+            "赵梓琛": "赵zc",
+            "卞一宸": "byc",
+            "章文元": "zyw",
+            "施沁皓": "sqh",
+            "秦添城": "qtc",
+            "季任杰": "jrj",
+            "黄伶俐": "hll",
+            "高鑫博": "gxb",
+            "郑子健": "zzj",
+            "金逸阳": "jyy",
+            "范雨涵": "fyh",
+            "胡喆": "hz",
+            "谢承哲": "xcz",
+            "何文馨": "hwx",
+            "沈澄婕": "scj",
+            "张志成": "张zc",
+            "孟真": "mz",
+            "黄梓睿": "hzr",
+            "冷雨霏": "lyf",
+            "黄芊涵": "hqh",
+            "欧鹭": "ol",
+            "姚舒馨": "ysx",
+            "施博文": "sbw",
+            "曾靖舒": "zjs",
+            "董玫妤": "dmy",
+            "陆泽灏": "lzh",
+            "戚银潞": "qyl",
+            "窦竞天": "djt",
+        }
+        self._build()
+        self.refresh()
+    # ---------- 菜单 ----------
+    def _build_menu(self):
+        menubar = tk.Menu(self.root)
+        menu = tk.Menu(menubar, tearoff=0)
+        menu.add_command(label="说明", command=self.show_help)
+        menu.add_separator()
+        menu.add_command(label="快速跑500局", command=self.on_sim_500)
+        menu.add_command(label="快速跑5000局", command=self.on_sim_5000)
+        menu.add_command(label="快速跑50000局", command=self.on_sim_50000)
+        menu.add_separator()
+        menu.add_checkbutton(label="输出异常日志到脚本目录(error_log.txt)", variable=self.export_error_log, command=self._on_toggle_export_error)
+        menu.add_checkbutton(label="自动跳过回合（回合结束后5秒）", variable=self.auto_skip_turn, command=self._on_toggle_auto_skip)
+        menu.add_checkbutton(label="找自称无敌模式", variable=self.joke_mode, command=self._on_toggle_joke_mode)
+        menu.add_checkbutton(label="保留历史记录", variable=self.preserve_history)
+        menu.add_checkbutton(label="显示实名", variable=self.show_realname, command=self._on_toggle_show_realname)
+        menu.add_checkbutton(label="显示首字母", variable=self.show_initials, command=self._on_toggle_show_initials)
+        menu.add_separator()
+        menu.add_command(label="字体放大", command=lambda: self.adjust_font(2))
+        menu.add_command(label="字体缩小", command=lambda: self.adjust_font(-2))
+        menubar.add_cascade(label="菜单", menu=menu)
+        self.root.config(menu=menubar)
+    def _on_toggle_export_error(self):
+        self.engine.export_error_log = bool(self.export_error_log.get())
+        if self.engine.export_error_log:
             try:
-                self.btn_turn.config(state="disabled")
-                self.btn_step.config(state="disabled")
-                self.btn_auto.config(state="disabled")
-                self.btn_pause.config(state="disabled")
-            except Exception:
-                pass
-
-
-        def _set_rank_row(self, idx: int, left_text: str, status_parts: List[str], highlight: bool):
-            bg = "#FFF2A8" if highlight else self.root.cget("bg")
-            row = self.rank_rows[idx]["frame"]
-            name_lbl = self.rank_rows[idx]["name"]
-            tags_frame = self.rank_rows[idx]["tags"]
-
-            row.configure(bg=bg)
-            name_lbl.configure(text=left_text, bg=bg)
-
-            # 清掉旧标签（只清标签，不销毁整行）
-            for w in tags_frame.winfo_children():
-                w.destroy()
-            tags_frame.configure(bg=bg)
-
-            for part in status_parts:
-                part = part.strip()
-                if not part:
-                    continue
-
-                if part.startswith("雷霆"):
-                    fg = self.color_thunder
-                elif part.startswith("霜冻"):
-                    fg = self.color_frost
-                elif part.startswith("腐化"):
-                    fg = self.color_purple
-                elif part.startswith(self.pos_keywords):
-                    fg = self.color_pos
-                else:
-                    fg = self.color_neg
-
-                tk.Label(tags_frame, text=f" {part} ", font=self.font_rank, fg=fg, bg=bg).pack(side="left", padx=2)
-
-        def show_help(self):
-            win = tk.Toplevel(self.root)
-            win.title("游戏说明")
-            win.geometry("700x500")
-
-            text = tk.Text(win, wrap="word", font=("Microsoft YaHei UI", 12))
-            text.pack(fill="both", expand=True, padx=10, pady=10)
-
-            scrollbar = ttk.Scrollbar(win, command=text.yview)
-            scrollbar.pack(side="right", fill="y")
-            text.config(yscrollcommand=scrollbar.set)
-
-            help_text = """
-    made by dian_mi
-    但是其实基本都是ChatGPT写的
-    欢迎大家游玩 
-        """
-
-            text.insert("1.0", help_text)
-            text.config(state="disabled")
-
-
-        def _build(self):
-            self.main = ttk.Frame(self.root, padding=8)
-            self.main.pack(fill=tk.BOTH, expand=True)
-
-            self.main.columnconfigure(0, weight=3)
-            self.main.columnconfigure(1, weight=2)
-            self.main.rowconfigure(0, weight=1)
-            self.main.rowconfigure(1, weight=0)
-
-            # 左：排名（单栏，大）
-            self.left = ttk.Frame(self.main)
-            self.left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-            self.left.columnconfigure(0, weight=1)
-            self.left.rowconfigure(0, weight=1)
-
-            # 单栏容器
-            self.rank_frame = ttk.Frame(self.left)
-            self.rank_frame.grid_columnconfigure(0, weight=1)
-
-            # 预建最多26行，避免每次destroy重建导致闪跳
-            for i in range(26):
-                row = tk.Frame(self.rank_frame, bg=self.root.cget("bg"))
-                row.grid(row=i, column=0, sticky="ew", pady=2)
-
-                name_lbl = tk.Label(row, text="", anchor="w", font=self.font_rank, bg=self.root.cget("bg"))
-                name_lbl.pack(side="left")
-
-                tags_frame = tk.Frame(row, bg=self.root.cget("bg"))
-                tags_frame.pack(side="left", padx=6)
-
-                self.rank_rows.append({"frame": row, "name": name_lbl, "tags": tags_frame})
-            self.rank_frame.grid(row=0, column=0, sticky="nsew")
-
-            # 右：日志
-            self.right = ttk.Frame(self.main)
-            self.right.grid(row=0, column=1, sticky="nsew")
-            self.right.rowconfigure(0, weight=1)
-            self.right.columnconfigure(0, weight=1)
-
-            self.log_text = tk.Text(self.right, wrap="word", font=self.font_log)
-            self.log_text.grid(row=0, column=0, sticky="nsew")
-            scroll = ttk.Scrollbar(self.right, command=self.log_text.yview)
-            scroll.grid(row=0, column=1, sticky="ns")
-            self.log_text.configure(yscrollcommand=scroll.set)
+                with open(self.engine._error_log_path(), "a", encoding="utf-8") as f:
+                    f.write("\n=== Error log enabled ===\n")
+            except Exception as e:
+                self.log_text.configure(state="normal")
+                self.log_text.insert(tk.END, f"\n【警告】无法写入异常日志文件：{e}\n")
+                self.log_text.configure(state="disabled")
+        try:
+            self.log_text.configure(state="normal")
+            self.log_text.insert(tk.END, "\n【设置】异常日志输出：%s\n路径：{self.engine._error_log_path()}\n" % ("开启" if self.engine.export_error_log else "关闭"))
             self.log_text.configure(state="disabled")
+            self.log_text.see(tk.END)
+        except Exception:
+            pass
 
-            # 底部按钮
-            self.bottom = ttk.Frame(self.main)
-            self.bottom.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-            self.bottom.columnconfigure(0, weight=1)
+    def _on_toggle_auto_skip(self):
+        """Toggle auto-skip timer. When turned off, cancel any pending after() job."""
+        if not self.auto_skip_turn.get():
+            if self._auto_skip_job is not None:
+                try:
+                    self.root.after_cancel(self._auto_skip_job)
+                except Exception:
+                    pass
+                self._auto_skip_job = None
+    def _on_toggle_joke_mode(self):
+        """Toggle joke mode and synchronize to engine."""
+        try:
+            self.engine.joke_mode = bool(self.joke_mode.get())
+            if 25 in self.engine.roles:
+                st = self.engine.roles[25].status
+                st.__dict__["fake_99999"] = bool(self.joke_mode.get())
+        except Exception:
+            pass
 
-
-            # 左下角（用 grid 体系，避免 pack/grid 混用导致布局/闪退）
-            left_box = ttk.Frame(self.bottom)
-            left_box.grid(row=0, column=0, sticky="w")
-
-            ttk.Button(left_box, text="说明", command=self.show_help).pack(side="left", padx=8)
-            ttk.Button(left_box, text="新开局", command=self.on_new).pack(side="left", padx=8)
-
-
-
-            self.btn_turn = ttk.Button(self.bottom, text="下一回合", command=self.on_build_turn)
-            self.btn_turn.grid(row=0, column=1, padx=8)
-
-            self.btn_step = ttk.Button(self.bottom, text="下一行", command=self.on_step_line)
-            self.btn_step.grid(row=0, column=2, padx=8)
-
-            self.btn_auto = ttk.Button(self.bottom, text="自动播放", command=self.on_auto_play)
-            self.btn_auto.grid(row=0, column=3, padx=8)
-
-            self.btn_pause = ttk.Button(self.bottom, text="暂停", command=self.on_pause)
-            self.btn_pause.grid(row=0, column=4, padx=8)
-            # 速度控制：0.1s ~ 2.0s
-            ttk.Label(self.bottom, text="播放速度").grid(row=0, column=5, padx=(20, 6))
-
-            self.speed_scale = ttk.Scale(
-                self.bottom,
-                from_=0.1,
-                to=2.0,
-                orient="horizontal",
-                variable=self.speed_var,
-                command=lambda _v: self._update_speed_label()
-            )
-            self.speed_scale.grid(row=0, column=6, padx=6, sticky="ew")
-
-            self.speed_label = ttk.Label(self.bottom, text="")
-            self.speed_label.grid(row=0, column=7, padx=(6, 0))
-
-            self.bottom.columnconfigure(6, weight=1)
-            self._update_speed_label()
-
-        def _render_rank_row(self, parent, text_left: str, status_parts: List[str], highlight: bool):
-            row_bg = "#FFF2A8" if highlight else self.root.cget("bg")
-            row = tk.Frame(parent, bg=row_bg)
-            row.pack(fill="x", pady=2)
-
-            name_lbl = tk.Label(row, text=text_left, anchor="w", font=self.font_rank, bg=row_bg)
+    # ---------- UI 构建 ----------
+    def _build(self):
+        self._build_menu()
+        self.main = ttk.Frame(self.root, padding=8)
+        self.main.pack(fill=tk.BOTH, expand=True)
+        self.main.columnconfigure(0, weight=2, uniform="main")
+        self.main.columnconfigure(1, weight=1, uniform="main")
+        self.main.rowconfigure(0, weight=1)
+        # 左：排名
+        self.left = ttk.Frame(self.main)
+        self.left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        self.left.columnconfigure(0, weight=1)
+        self.left.rowconfigure(0, weight=1)
+        self.rank_frame = ttk.Frame(self.left)
+        self.rank_frame.grid(row=0, column=0, sticky="nsew")
+        self.rank_frame.columnconfigure(0, weight=1)
+        self.rank_frame.columnconfigure(1, weight=1)
+        # 预建行池：为“未来可能添加更多角色”准备，默认给 40 行
+        self.max_rows = max(40, len(self.engine.roles) + 8)
+        self.rank_rows: List[Dict[str, Any]] = []
+        for i in range(self.max_rows):
+            row = tk.Frame(self.rank_frame, bg=self.root.cget("bg"))
+            name_lbl = tk.Label(row, text="", anchor="w", font=self.font_rank, bg=self.root.cget("bg"))
             name_lbl.pack(side="left")
+            tags_frame = tk.Frame(row, bg=self.root.cget("bg"))
+            tags_frame.pack(side="right", padx=6)
+            self.rank_rows.append({"frame": row, "name": name_lbl, "tags": tags_frame})
+        # 右：日志
+        self.right = ttk.Frame(self.main)
+        self.right.grid(row=0, column=1, sticky="nsew")
+        self.right.rowconfigure(0, weight=1)
+        self.right.columnconfigure(0, weight=1)
+        self.log_text = tk.Text(self.right, wrap="word", font=self.font_log)
+        self.log_text.grid(row=0, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(self.right, command=self.log_text.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.log_text.configure(yscrollcommand=scroll.set, state="disabled")
+        # 底部按钮
+        self.bottom = ttk.Frame(self.main)
+        self.bottom.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Button(self.bottom, text="新开局", command=self.on_new).grid(row=0, column=0, padx=8)
+        self.btn_turn = ttk.Button(self.bottom, text="下一回合", command=self.on_build_turn)
+        self.btn_turn.grid(row=0, column=1, padx=8)
+        self.btn_step = ttk.Button(self.bottom, text="下一行", command=self.on_step_line)
+        self.btn_step.grid(row=0, column=2, padx=8)
+        self.btn_auto = ttk.Button(self.bottom, text="自动播放", command=self.on_auto_play)
+        self.btn_auto.grid(row=0, column=3, padx=8)
+        self.btn_pause = ttk.Button(self.bottom, text="暂停", command=self.on_pause)
+        self.btn_pause.grid(row=0, column=4, padx=8)
+        ttk.Label(self.bottom, text="播放速度").grid(row=0, column=5, padx=(20, 6))
+        self.speed_scale = ttk.Scale(
+            self.bottom,
+            from_=0.1,
+            to=2.0,
+            orient="horizontal",
+            variable=self.speed_var,
+            command=lambda _v: self._update_speed_label()
+        )
+        self.speed_scale.grid(row=0, column=6, padx=6, sticky="ew")
+        self.speed_label = ttk.Label(self.bottom, text="")
+        self.speed_label.grid(row=0, column=7, padx=(6, 0))
+        self.bottom.columnconfigure(6, weight=1)
+        self._update_speed_label()
+    def _update_speed_label(self):
+        try:
+            v = float(self.speed_var.get())
+        except Exception:
+            v = 0.25
+        self.speed_label.config(text=f"{v:.2f}s/行")
+    # ---------- 名字展示（实名/首字母） ----------
+    def _on_toggle_show_realname(self):
+        """互斥：开启显示实名时自动关闭显示首字母。"""
+        if self.show_realname.get() and self.show_initials.get():
+            self.show_initials.set(False)
+        self.refresh()
 
-            tag_labels = []
-            for part in status_parts:
-                part = part.strip()
-                if not part:
-                    continue
+    def _on_toggle_show_initials(self):
+        """互斥：开启显示首字母时自动关闭显示实名。"""
+        if self.show_initials.get() and self.show_realname.get():
+            self.show_realname.set(False)
+        self.refresh()
 
-                if part.startswith("雷霆"):
-                    fg = self.color_thunder
-                elif part.startswith("腐化"):
-                    fg = self.color_purple
-                elif part.startswith(self.pos_keywords):
-                    fg = self.color_pos
-                else:
-                    fg = self.color_neg
+    def _display_name(self, cid: int) -> str:
 
-                tag = tk.Label(row, text=f" {part} ", font=self.font_rank, fg=fg, bg=row_bg)
-                tag.pack(side="left", padx=2)
-                tag_labels.append(tag)
+        """根据开关返回展示名：原昵称 / 实名 / 首字母（互斥）。并清理首尾空格。"""
 
-            return row, name_lbl, tag_labels
+        name = self.engine.roles[cid].name.strip()
 
-        def on_new(self):
-            self.engine.new_game()
-            self.play_cursor = 0
-            self.playing = False
-            self.revealed_lines = []
-            self.revealed_hls = []
-            self.revealed_victims = []
-            self.current_snap = None
-            self.refresh()
+        if self.show_realname.get():
+
+            return self.REALNAME_MAP.get(name, name).strip()
+
+        if self.show_initials.get():
+
+            real = self.REALNAME_MAP.get(name, name).strip()
+
+            return self.INITIALS_MAP.get(real, real).strip()
+
+        return name
+    def _rewrite_names_in_line(self, line: str) -> str:
+        """Normalize name tokens in log lines.
+        - Always remove '(cid)' or '（cid）' suffixes from names in logs.
+        - If 'show realname' or 'show initials' is enabled, convert names accordingly.
+        """
+        # Match both ASCII and full-width parentheses: Name(12) / Name（12）
+        pattern = re.compile(r'([\u4e00-\u9fffA-Za-z0-9_\-·\.\s]{1,30})[\(（]\s*(\d+)\s*[\)）]')
+        use_mode = self.show_realname.get() or (hasattr(self, "show_initials") and self.show_initials.get())
+        def repl(m):
+            cid = int(m.group(2))
+            if use_mode:
+                return self._display_name(cid)
+            # mode off: keep original name but strip spaces (and remove cid)
+            return m.group(1).strip()
+        return pattern.sub(repl, line)
+        def repl(m):
+            cid = int(m.group(2))
+            return f"{self._display_name(cid)}"
+        return pattern.sub(repl, line)
+        def repl(m):
+            cid = int(m.group(2))
+            if cid in self.engine.roles:
+                return f"{self._display_name(cid)}({cid})"
+            return m.group(0)
+        return token_pat.sub(repl, line)
+    # ---------- 说明 ----------
+    
+    def adjust_font(self, delta: int):
+        # 菜单：动态调整字体大小（影响排行榜与日志）
+        new_size = self.font_size + delta
+        new_size = max(10, min(40, new_size))
+        if new_size == self.font_size:
+            return
+        self.font_size = new_size
+        self.font_rank.configure(size=self.font_size)
+        self.font_log.configure(size=self.font_size)
+        self.font_log_bold.configure(size=self.font_size)
+        # 触发一次刷新，确保显示稳定
+        self.refresh()
+    def show_help(self):
+        win = tk.Toplevel(self.root)
+        win.title("游戏说明")
+        win.geometry("700x520")
+        text = tk.Text(win, wrap="word", font=("Microsoft YaHei UI", 12))
+        text.pack(fill="both", expand=True, padx=10, pady=10)
+        scrollbar = ttk.Scrollbar(win, command=text.yview)
+        scrollbar.pack(side="right", fill="y")
+        text.config(yscrollcommand=scrollbar.set)
+        help_text = """
+made by dian_mi
+但是其实都是GPT大人神力
+欢迎大家游玩
+菜单说明：
+- 快速跑5000局：完整规则蒙特卡洛统计（界面可能短暂无响应）
+- 自动跳过回合：每次回合日志播完后，等待5秒自动推进下一回合
+- 保留历史记录：推进新回合时，右侧日志不清空、会继续累积（便于复盘）
+"""
+        text.insert("1.0", help_text.strip())
+        text.config(state="disabled")
+    # ---------- 新开局 ----------
+    def on_new(self):
+        if self._auto_skip_job is not None:
             try:
-                self.btn_turn.config(state="normal")
-                self.btn_step.config(state="normal")
-                self.btn_auto.config(state="normal")
-                self.btn_pause.config(state="normal")
+                self.root.after_cancel(self._auto_skip_job)
             except Exception:
                 pass
-
-        def on_build_turn(self):
-            # 先结算一整回合，但不直接展示整回合结果
-            self.engine.tick_alive_turns()
-            self.engine.next_turn()
-
-
-
-            self.play_cursor = 0
-            self.playing = False
-            self.revealed_lines = []
-            self.revealed_hls = []
-            self.revealed_victims = []
-            self.current_snap = None
-
-            # 默认先显示第一行，然后自动播放剩余行
-            if self.engine.replay_frames:
-                self.on_step_line()      # 显示第1行
-                self.playing = True      # 开启播放
-                self.on_step_line()      # 继续播放下一行（等同于自动播放）
-            else:
-                self.refresh()
-
-        def on_step_line(self):
-            frames = self.engine.replay_frames
-
-            # 已经播完：此时如果 game_over，再禁用按钮
-            if self.play_cursor >= len(frames):
-                self.playing = False
-                if getattr(self.engine, "game_over", False):
-                    self._set_game_over_buttons()
-                return
-
-            frame = frames[self.play_cursor]
-            self.play_cursor += 1
-
-            self.revealed_lines.append(frame["text"])
-            self.revealed_hls.append(frame.get("highlights", []))
-            self.revealed_victims.append(self._parse_victim_cid(frame["text"]))
-            self.current_snap = frame["snap"]
-            self.current_highlights = set(frame.get("highlights", []))
-
-            self.refresh_replay_view()
-
-            if self.playing:
-                delay_ms = int(max(0.1, min(2.0, float(self.speed_var.get()))) * 1000)
-                self.root.after(delay_ms, self.on_step_line)
-
-
-        def on_auto_play(self):
-            if not self.engine.replay_frames:
-                return
-            self.playing = True
-            self.on_step_line()
-
-        def on_pause(self):
-            self.playing = False
-
-        def _parse_victim_cid(self, line: str) -> Optional[int]:
-            # 死亡行："【死亡】名字(cid)..."
-            if "【死亡】" in line:
-                m = self._cid_pat.search(line)
-                return int(m.group(1)) if m else None
-
-            # 击杀行："【击杀】凶手(...) → 受害者(cid)..."
-            if "【击杀】" in line:
-                ids = [int(m.group(1)) for m in self._cid_pat.finditer(line)]
-                if len(ids) >= 2:
-                    return ids[1]  # 第二个(cid)是受害者
-                return None
-
-            return None
-            
-        def _update_speed_label(self):
+            self._auto_skip_job = None
+        self.engine.new_game()
+        self.play_cursor = 0
+        self.playing = False
+        self.revealed_lines = []
+        self.revealed_hls = []
+        self.revealed_victims = []
+        self.current_snap = None
+        self.current_highlights = set()
+        self._set_buttons_enabled(True)
+        self.refresh()
+    def _set_buttons_enabled(self, enabled: bool):
+        state = "normal" if enabled else "disabled"
+        for b in (self.btn_turn, self.btn_step, self.btn_auto, self.btn_pause):
             try:
-                v = float(self.speed_var.get())
+                b.config(state=state)
             except Exception:
-                v = 0.25
-            self.speed_label.config(text=f"{v:.2f}s/行")
+                pass
+    # ---------- 快速模拟 ----------
+    
+    def _run_quick_sim(self, GAMES: int):
+        try:
+            self.log_text.configure(state="normal")
+            self.log_text.insert(tk.END, f"\n【测试】开始快速模拟{GAMES}局…（期间界面可能短暂无响应）\n")
+            self.log_text.configure(state="disabled")
+            self.log_text.see(tk.END)
+            self.root.update_idletasks()
+        except Exception:
+            pass
+        first_cnt = {cid: 0 for cid in self.engine.roles.keys()}
+        top3_cnt = {cid: 0 for cid in self.engine.roles.keys()}
+        top10_cnt = {cid: 0 for cid in self.engine.roles.keys()}
+        place_sum = {cid: 0 for cid in self.engine.roles.keys()}
+        place_cnt = {cid: 0 for cid in self.engine.roles.keys()}
+        survive_sum = {cid: 0 for cid in self.engine.roles.keys()}
+        survive_cnt = {cid: 0 for cid in self.engine.roles.keys()}
+        errors = 0
+        first_err = None
 
+        timeouts = 0
+        skill_errors = 0
+        valid_games = 0
+        seed_rng = random.Random()
+        for gi in range(GAMES):
+            try:
+                e = Engine(seed=seed_rng.randint(1, 10**9), fast_mode=True)
+                seed = e.base_seed
 
-        def _clear_flash(self):
-            self._flash_job = None
-            if not self.current_snap:
-                return
-
-            # 把当前高亮的行恢复背景
-            normal_bg = self.root.cget("bg")
-            for cid in list(self.prev_highlights):
-                row = self.row_cid_map.get(cid)
-                if row:
-                    row.configure(bg=normal_bg)
-                    # 子控件也要一起改，否则里面label背景不变会“花”
-                    for child in row.winfo_children():
+                # [v19 debug] 继承UI开关到快速跑引擎，并写入每局标记
+                e.export_error_log = bool(self.engine.export_error_log)
+                if e.export_error_log:
+                    try:
+                        with open(self.engine._error_log_path(), "a", encoding="utf-8") as f:
+                            f.write("\n[v19] quick_sim start seed=%s\n" % (e.base_seed,))
+                            f.flush()
+                    except Exception as _e:
                         try:
-                            child.configure(bg=normal_bg)
+                            self.log_text.configure(state="normal")
+                            self.log_text.insert(tk.END, f"\n【警告】写入error_log失败：{_e}\n")
+                            self.log_text.configure(state="disabled")
                         except Exception:
                             pass
+                # Run until game over (or until safety cap). If cap is hit, treat as timeout and exclude.
+                MAX_TURNS = 50000
+                for __ in range(MAX_TURNS):
+                    if e.game_over:
+                        break
+                    e.tick_alive_turns()
+                    e.next_turn()
+                if (not e.game_over) and len(e.alive_ids()) > 1:
+                    timeouts += 1
+                    continue
+                # If any skill exception happened, treat the game as invalid (rules not executed correctly).
+                if e.skill_exception_count > 0:
+                    skill_errors += 1
 
-            self.prev_highlights = set()
+                if e.skill_exception_count > 0 and getattr(e, "export_error_log", False):
+                    try:
+                        with open(e._error_log_path(), "a", encoding="utf-8") as f:
+                            f.write("\n=== Game %d skill_exceptions=%d seed=%s ===\n" % (gi+1, e.skill_exception_count, seed))
+                            for ex in getattr(e, "skill_exception_examples", [])[:20]:
+                                if len(ex) == 3:
+                                    cid_, msg_, tb_ = ex
+                                else:
+                                    cid_, msg_ = ex[0], ex[1]
+                                    tb_ = ""
+                                f.write("- %s: %s\n" % (e.N(cid_), msg_))
+                                if tb_:
+                                    f.write(tb_ + "\n")
+                    except Exception:
+                        pass
+                    continue
+                alive = e.alive_ids()
 
-            snap = self.current_snap
-            rank = snap["rank"]
-            status_map = snap["status"]
+                if getattr(e, "export_error_log", False):
+                    try:
+                        with open(e._error_log_path(), "a", encoding="utf-8") as f:
+                            f.write("\n=== Game %d seed=%s skill_exception_count=%d ===\n" % (gi+1, seed, e.skill_exception_count))
+                            if e.skill_exception_count > 0:
+                                for ex in getattr(e, "skill_exception_examples", [])[:20]:
+                                    if len(ex) == 3:
+                                        cid_, msg_, tb_ = ex
+                                    else:
+                                        cid_, msg_ = ex[0], ex[1]
+                                        tb_ = ""
+                                    f.write("- %s: %s\n" % (e.N(cid_), msg_))
+                                    if tb_:
+                                        f.write(tb_ + "\n")
+                            f.flush()
+                    except Exception:
+                        pass
+                npc_ids = {HW_CID, LDL_CID}
+                alive_players = [cid for cid in alive if cid not in npc_ids]
+                # 统计每名角色的存活回合数：死亡回合=被淘汰回合；存活到最后=本局总回合数
+                for cid_ in self.engine.roles.keys():
+                    if cid_ in npc_ids:
+                        continue
+                    if cid_ in alive_players:
+                        sturn = int(e.turn)
+                    else:
+                        sturn = int(e.elimination_turn.get(cid_, e.turn))
+                    survive_sum[cid_] += sturn
+                    survive_cnt[cid_] += 1
 
-            # 重建左侧，但不做高亮色
-            for w in self.rank_frame.winfo_children():
+                elim_players = [cid for cid in e.elimination_order if cid not in npc_ids]
+
+                if len(alive) == 1 and alive_players:
+                    # 最终存活者为角色
+                    first = alive_players[0]
+                    second = elim_players[-1] if len(elim_players) >= 1 else None
+                    third = elim_players[-2] if len(elim_players) >= 2 else None
+                else:
+                    # 最终存活者为NPC或无人存活：前三名取“最后死亡的三名角色”
+                    first = elim_players[-1] if len(elim_players) >= 1 else None
+                    second = elim_players[-2] if len(elim_players) >= 2 else None
+                    third = elim_players[-3] if len(elim_players) >= 3 else None
+
+                # 计算本局最终名次（1为冠军，其次为最后淘汰者…）
+                place_map = {}
+                if len(alive) == 1 and alive_players:
+                    # 冠军为最终存活者
+                    place_map[alive_players[0]] = 1
+                    for i, cid_ in enumerate(reversed(elim_players), start=2):
+                        place_map[cid_] = i
+                else:
+                    # 无角色存活或冠军为NPC：名次按最后淘汰顺序倒序
+                    for i, cid_ in enumerate(reversed(elim_players), start=1):
+                        place_map[cid_] = i
+                for cid_, pl in place_map.items():
+                    place_sum[cid_] += int(pl)
+                    place_cnt[cid_] += 1
+                    if int(pl) <= 10:
+                        top10_cnt[cid_] += 1
+
+                if first is not None:
+                    first_cnt[first] += 1
+                    top3_cnt[first] += 1
+                if second is not None:
+                    top3_cnt[second] += 1
+                if third is not None:
+                    top3_cnt[third] += 1
+                valid_games += 1
+            except Exception as ex:
+                errors += 1
+                if first_err is None:
+                    first_err = ex
+                    try:
+                        import traceback as _tb
+                        tb_txt = _tb.format_exc()
+                        self.log_text.configure(state='normal')
+                        self.log_text.insert(tk.END, '\n【快速跑异常示例】\n' + tb_txt + '\n')
+                        self.log_text.configure(state='disabled')
+                    except Exception:
+                        pass
+        
+        # Build two separate tables: Champion win rate and Top-3 win rate (exclude NPCs).
+        npc_ids = {HW_CID, LDL_CID}
+        role_ids = [cid for cid in first_cnt.keys() if cid not in npc_ids]
+        champ_rows = []
+        top3_rows = []
+        for cid in role_ids:
+            champ_rate = (first_cnt[cid] / valid_games * 100.0) if valid_games > 0 else 0.0
+            top3_rate = (top3_cnt[cid] / valid_games * 100.0) if valid_games > 0 else 0.0
+            champ_rows.append((cid, champ_rate))
+            top3_rows.append((cid, top3_rate))
+        champ_rows.sort(key=lambda x: (-x[1], x[0]))
+        top3_rows.sort(key=lambda x: (-x[1], x[0]))
+
+        win = tk.Toplevel(self.root)
+        win.title(f"{GAMES}局统计（冠军/前三名胜率）")
+        win.geometry("560x780")
+        textw = tk.Text(win, wrap="none", font=("Consolas", 12))
+        textw.tag_configure('hdr', font=('Microsoft YaHei', 11, 'bold'))
+        textw.tag_configure('title', font=('Microsoft YaHei', 13, 'bold'))
+        textw.tag_configure('alt', background='#f2f2f2')
+        textw.tag_configure('hl', background='#ffe8a3')
+        NAME_W = 22
+        VAL_W = 12
+        SEP_W = 40
+        textw.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # Summary
+        issues = (errors > 0) or (skill_errors > 0) or (timeouts > 0)
+        textw.insert(tk.END, f"总局数：{GAMES}\n")
+        textw.insert(tk.END, f"正常局数：{valid_games}\n")
+        textw.insert(tk.END, f"错误局数：{errors}\n")
+        textw.insert(tk.END, f"技能异常局数：{skill_errors}\n")
+        textw.insert(tk.END, f"超时未结束局数：{timeouts}\n")
+        textw.insert(tk.END, f"是否出现问题：{'是' if issues else '否'}\n\n")
+
+        textw.insert(tk.END, "冠军统计胜率（按胜率从高到低）\n", 'title')
+        textw.insert(tk.END, f"{'角色':<{NAME_W}} {'胜率':>8} {'胜场':>6}\n", 'hdr')
+        textw.insert(tk.END, "-" * SEP_W + "\n")
+        for i, (cid, rate) in enumerate(champ_rows):
+            tag = None
+            if i < 3:
+                tag = 'hl'
+            elif i % 2 == 1:
+                tag = 'alt'
+            textw.insert(tk.END, f"{self.engine.N(cid):<{NAME_W}} {rate:7.3f}% {first_cnt[cid]:6d}\n", tag)
+
+        textw.insert(tk.END, "\n前三名统计胜率（按胜率从高到低）\n")
+        textw.insert(tk.END, f"{'角色':<{NAME_W}} {'胜率':>8} {'胜场':>6}\n", 'hdr')
+        textw.insert(tk.END, "-" * SEP_W + "\n")
+        for i, (cid, rate) in enumerate(top3_rows):
+            tag = None
+            if i < 3:
+                tag = 'hl'
+            elif i % 2 == 1:
+                tag = 'alt'
+            textw.insert(tk.END, f"{self.engine.N(cid):<{NAME_W}} {rate:7.3f}% {top3_cnt[cid]:6d}\n", tag)
+
+
+        # ---- 平均排名（独立统计）----
+        avg_rows = []
+        for cid in self.engine.roles.keys():
+            if place_cnt.get(cid, 0) > 0:
+                avg_place = place_sum[cid] / place_cnt[cid]
+                avg_rows.append((cid, avg_place))
+        avg_rows.sort(key=lambda x: (x[1], x[0]))
+
+        textw.insert(tk.END, "\n平均排名统计（按平均排名从低到高）\n", 'hdr')
+        textw.insert(tk.END, f"{'角色':<{NAME_W}} {'平均排名':>{VAL_W}}\n", 'hdr')
+        textw.insert(tk.END, "-" * SEP_W + "\n")
+        for i, (cid, avg_place) in enumerate(avg_rows):
+            tag = None
+            if i < 3:
+                tag = 'hl'
+            elif i % 2 == 1:
+                tag = 'alt'
+            textw.insert(tk.END, f"{self.engine.N(cid):<{NAME_W}} {avg_place:{VAL_W}.3f}\n", tag)
+        textw.insert(tk.END, "-" * SEP_W + "\n")
+        textw.insert(tk.END, "\n")
+
+        # ---- 平均存活回合数（独立统计）----
+        surv_rows = []
+        for cid in self.engine.roles.keys():
+            if survive_cnt.get(cid, 0) > 0:
+                avg_surv = survive_sum[cid] / survive_cnt[cid]
+                surv_rows.append((cid, avg_surv))
+        surv_rows.sort(key=lambda x: (-x[1], x[0]))  # 存活越久越靠前
+
+        textw.insert(tk.END, "\n平均存活回合数统计（按平均存活回合从高到低）\n", 'hdr')
+        textw.insert(tk.END, f"{'角色':<{NAME_W}} {'平均存活回合':>{VAL_W}}\n", 'hdr')
+        textw.insert(tk.END, "-" * SEP_W + "\n")
+        for i, (cid, avg_surv) in enumerate(surv_rows):
+            tag = None
+            if i < 3:
+                tag = 'hl'
+            elif i % 2 == 1:
+                tag = 'alt'
+            textw.insert(tk.END, f"{self.engine.N(cid):<{NAME_W}} {avg_surv:{VAL_W}.3f}\n", tag)
+        textw.insert(tk.END, "-" * SEP_W + "\n")
+        textw.configure(state="disabled")
+    def on_sim_5000(self):
+        self._run_quick_sim(5000)
+
+    def on_sim_500(self):
+        self._run_quick_sim(500)
+
+    def on_sim_50000(self):
+        self._run_quick_sim(50000)
+
+
+    def on_build_turn(self):
+        # If auto-skip had scheduled a pending turn advance, cancel it when user manually advances.
+        try:
+            if self._auto_skip_job is not None:
+                self.root.after_cancel(self._auto_skip_job)
+        except Exception:
+            pass
+        self._auto_skip_job = None
+        if self.engine.game_over:
+            return
+        try:
+            if self._play_job is not None:
+                self.root.after_cancel(self._play_job)
+        except Exception:
+            pass
+        self._play_job = None
+        # 新回合开始：如果不保留历史，就清空“逐行展示缓存”
+        if not self.preserve_history.get():
+            self.revealed_lines = []
+            self.revealed_hls = []
+            self.revealed_victims = []
+        self.engine.tick_alive_turns()
+        self.engine.next_turn()
+        self.play_cursor = 0
+        self.playing = False
+        self.current_snap = None
+        self.current_highlights = set()
+        # 默认显示第一行并继续自动播放一行（与旧版一致）
+        if self.engine.replay_frames:
+            self.on_step_line()
+            self.playing = True
+            self.on_step_line()
+        else:
+            self.refresh()
+    def on_step_line(self):
+        frames = self.engine.replay_frames
+        if self.play_cursor >= len(frames):
+            self.playing = False
+            try:
+                if self._play_job is not None:
+                    self.root.after_cancel(self._play_job)
+            except Exception:
+                pass
+            self._play_job = None
+            if self.engine.game_over:
+                self._set_buttons_enabled(False)
+            else:
+                # 自动跳回合：回合日志播完后，5秒推进下一回合
+                if self.auto_skip_turn.get():
+                    if self._auto_skip_job is not None:
+                        try:
+                            self.root.after_cancel(self._auto_skip_job)
+                        except Exception:
+                            pass
+                    self._auto_skip_job = self.root.after(5000, self.on_build_turn)
+            return
+        frame = frames[self.play_cursor]
+        self.play_cursor += 1
+        self.revealed_lines.append(frame["text"])
+        self.revealed_hls.append(frame.get("highlights", []))
+        self.revealed_victims.append(self._parse_victim_cid(frame["text"]))
+        self.current_snap = frame["snap"]
+        self.current_highlights = set(frame.get("highlights", []))
+        self.refresh_replay_view()
+        if self.playing:
+            delay_ms = int(max(0.1, min(2.0, float(self.speed_var.get()))) * 1000)
+            # If a random event is triggered, auto-pause 3 seconds for readability.
+            try:
+                if "触发随机事件：" in frame.get("text", ""):
+                    delay_ms = max(delay_ms, 3000)
+            except Exception:
+                pass
+            try:
+                if self._play_job is not None:
+                    self.root.after_cancel(self._play_job)
+            except Exception:
+                pass
+            self._play_job = self.root.after(delay_ms, self.on_step_line)
+    def on_auto_play(self):
+        if not self.engine.replay_frames:
+            return
+        # Avoid stacking multiple after() loops when clicking repeatedly
+        if self.playing:
+            return
+        self.playing = True
+        try:
+            if self._play_job is not None:
+                self.root.after_cancel(self._play_job)
+        except Exception:
+            pass
+        self._play_job = None
+        self.on_step_line()
+    def on_pause(self):
+        self.playing = False
+        try:
+            if self._play_job is not None:
+                self.root.after_cancel(self._play_job)
+        except Exception:
+            pass
+        self._play_job = None
+    def _parse_victim_cid(self, line: str) -> Optional[int]:
+        # Structured markers
+        if "【死亡】" in line:
+            m = self._cid_pat.search(line)
+            return int(m.group(1)) if m else None
+        if "【击杀】" in line:
+            ids = [int(m.group(1)) for m in self._cid_pat.finditer(line)]
+            if len(ids) >= 2:
+                return ids[1]
+
+        # Keywords that imply an elimination in this line (various modes/wordings)
+        keywords = ("淘汰", "斩杀", "zhansha", "处决")
+        if any(k in line for k in keywords):
+            # Prefer cid-based resolution if present
+            ids = [int(m.group(1)) for m in self._cid_pat.finditer(line)]
+            if len(ids) == 1:
+                return ids[0]
+            if len(ids) >= 2:
+                return ids[-1]
+
+            # Fallback: name-based resolution when the log line contains no (cid)
+            # Try to extract the target name that follows the keyword.
+            # e.g. "zhansha 书法家" / "斩杀 戚银潞" / "处决第4名：施沁皓"
+            seg = line
+            for k in keywords:
+                if k in seg:
+                    seg = seg.split(k, 1)[1]
+                    break
+            seg = seg.replace("：", " ").replace(":", " ")
+            seg = seg.strip()
+            if not seg:
+                return None
+            parts = seg.split()
+            if not parts:
+                return None
+            # Take the first token-like chunk as candidate name
+            cand = parts[0].strip("，。,.!！?？;；】")
+            if not cand:
+                return None
+
+            # Build a map of possible names (display name + real name if present) -> cid
+            for cid, role in self.engine.roles.items():
+                dn = self._display_name(cid)
+                if dn == cand:
+                    return cid
+                rn = getattr(role, "real_name", "") or ""
+                if rn and rn == cand:
+                    return cid
+                # also allow matching by role.name if display differs
+                nm = getattr(role, "name", "") or ""
+                if nm and nm == cand:
+                    return cid
+        return None
+    def _clean_log_text(self, line: str) -> str:
+        # Remove numeric prefix and cid in headers, e.g. 【23. Name(23)】 -> 【Name】
+        # Insert a space after ")" to avoid concatenated names after removing "(cid)"
+        line = re.sub(r"\)(?=\S)", ") ", line)
+        line = re.sub(r"【\s*\d+\s*\.\s*([^】(]+)\(\d+\)】", r"【\1】", line)
+        # Remove any remaining (cid) after names: Name(23) -> Name
+        line = re.sub(r"\(\d+\)", "", line)
+        line = re.sub(r"\s{2,}", " ", line)
+        return line
+
+    # ---------- 渲染 ----------
+    def _set_rank_row(self, idx: int, left_text: str, status_parts: List[str], highlight: bool):
+        bg = "#FFF2A8" if highlight else self.root.cget("bg")
+        row = self.rank_rows[idx]["frame"]
+        name_lbl = self.rank_rows[idx]["name"]
+        tags_frame = self.rank_rows[idx]["tags"]
+        row.configure(bg=bg)
+        # NPC name color in left rank list (explicit names)
+        if "洪伟" in left_text or "李东雷" in left_text:
+            name_fg = "#D4AF37"
+        else:
+            name_fg = "black"
+        name_lbl.configure(text=left_text, bg=bg, fg=name_fg)
+        for w in tags_frame.winfo_children():
+            w.destroy()
+        tags_frame.configure(bg=bg)
+        for part in status_parts:
+            part = part.strip()
+            if not part:
+                continue
+            if part.startswith("雷霆"):
+                fg = self.color_thunder
+            elif part.startswith("腐化"):
+                fg = self.color_purple
+            elif part.startswith("隐身"):
+                fg = "#A0A0A0"
+            elif part.startswith("鱼"):
+                fg = "#2E86C1"
+            elif part.startswith("濒亡"):
+                fg = "#E53935"
+            elif part.startswith("炸弹"):
+                fg = "#E53935"
+            elif part.startswith("越挫越勇"):
+                fg = "#8B4513"
+            elif part.startswith("神威"):
+                fg = "#D4AF37"
+            elif part.startswith("洪伟之赐"):
+                fg = "#D4AF37"
+            elif part.startswith("雷霆手腕"):
+                fg = "#0B3D91"
+            elif part.startswith("氧化") or part.startswith("还原"):
+                fg = "#006400"
+            elif part.startswith("附生"):
+                fg = "#F7DC6F"
+            elif part.startswith("孤军奋战"):
+                fg = "#D4AF37"
+            elif part.startswith("特异性免疫"):
+                fg = "#2ECC71"
+            elif part.startswith("净化"):
+                fg = "#7DCEA0"  # 浅绿色
+            elif part.startswith("圣辉"):
+                fg = "#D4AF37"  # 金色
+            elif part.startswith("感电"):
+                fg = "#85C1E9"  # 浅蓝色
+            elif part.startswith("乘胜追击"):
+                fg = "#F5B041"  # 浅橙色
+            elif part.startswith("目击"):
+                fg = "#8B4513"  # 棕色
+            elif part.startswith("辩护"):
+                fg = "#D4AF37"  # 金色
+            elif part.startswith("静默"):
+                fg = "#7D3C98"  # 灰紫
+            elif part.startswith("迂回"):
+                fg = "#76D7C4"  # 浅青
+            elif part.startswith("防线"):
+                fg = "#1E8449"  # 深绿
+            elif part.startswith("护盾"):
+                fg = self.color_pos
+            else:
+                fg = self.color_neg
+            lbl = tk.Label(tags_frame, text=f" {part} ", font=self.font_rank, fg=fg, bg=bg)
+            lbl.pack(side="left", padx=(0, 4))
+    def refresh_replay_view(self):
+        snap = self.current_snap
+        if not snap:
+            self.refresh()
+            return
+        rank = snap["rank"]
+        status_map = snap["status"]
+        normal_bg = self.root.cget("bg")
+        # 计算两列布局
+        total = len(rank)
+        rows_per_col = max(1, math.ceil(total / 2))
+        # 先隐藏全部行
+        for i in range(self.max_rows):
+            row = self.rank_rows[i]["frame"]
+            row.grid_forget()
+            # 清内容
+            self.rank_rows[i]["name"].configure(text="", bg=normal_bg)
+            for w in self.rank_rows[i]["tags"].winfo_children():
                 w.destroy()
-
-            self.rank_row_widgets = {}  # cid -> row(Frame)
-
-            for i, cid in enumerate(rank, start=1):
-                info = status_map[cid]
-                st = info["brief"]
-                left_text = f"{i:>2}. {info['name']}({cid})"
-                status_parts = st.split("；") if st else []
-
-                # 注意：_render_rank_row 返回 (row, name_lbl, tag_labels)
-                row, name_lbl, tag_labels = self._render_rank_row(
-                    self.rank_frame, left_text, status_parts, highlight=False
-                )
-                self.rank_row_widgets[cid] = row
-
-            # 右侧日志照常渲染
-            self.render_log_with_current_highlight(self.revealed_lines, self.revealed_hls)
-
-        def refresh_replay_view_no_flash(self):
-            snap = self.current_snap
-            if not snap:
-                self.refresh()
-                return
-
-            rank = snap["rank"]
-            status_map = snap["status"]
-
-            # 重新建立 cid -> 行frame 映射（供高亮用）
-            self.row_cid_map = {}
-
-            normal_bg = self.root.cget("bg")
-
-            # 先把26行都“清空/隐藏内容”（但不destroy）
-            for i in range(26):
-                row = self.rank_rows[i]["frame"]
-                name_lbl = self.rank_rows[i]["name"]
-                tags_frame = self.rank_rows[i]["tags"]
-
-                row.configure(bg=normal_bg)
-                name_lbl.configure(text="", bg=normal_bg)
-
-                for w in tags_frame.winfo_children():
-                    w.destroy()
-                tags_frame.configure(bg=normal_bg)
-
-            # 再填充存活排名
-            for i, cid in enumerate(rank):
-                info = status_map[cid]
-                st = info["brief"]
-                left_text = f"{i+1:>2}. {info['name']}({cid})"
-                status_parts = st.split("；") if st else []
-
-                self._set_rank_row(i, left_text, status_parts, highlight=False)
-                self.row_cid_map[cid] = self.rank_rows[i]["frame"]
-
-            # 右侧日志照常渲染
-            self.render_log_with_current_highlight(self.revealed_lines, self.revealed_hls)
-
-        def refresh_replay_view(self):
-            snap = self.current_snap
-            if not snap:
-                self.refresh()
-                return
-
-            rank = snap["rank"]
-            status_map = snap["status"]
-
-            # 重新建立 cid -> 行frame 映射（供高亮用）
-            self.row_cid_map = {}
-
-            normal_bg = self.root.cget("bg")
-
-            # 先把26行都清空（不destroy）
-            for i in range(26):
-                row = self.rank_rows[i]["frame"]
-                name_lbl = self.rank_rows[i]["name"]
-                tags_frame = self.rank_rows[i]["tags"]
-
-                row.configure(bg=normal_bg)
-                name_lbl.configure(text="", bg=normal_bg)
-
-                for w in tags_frame.winfo_children():
-                    w.destroy()
-                tags_frame.configure(bg=normal_bg)
-
-            # 填充存活排名 + 高亮当前行涉及角色
-            for i, cid in enumerate(rank):
-                info = status_map[cid]
-                st = info["brief"]
-                left_text = f"{i+1:>2}. {info['name']}({cid})"
-                status_parts = st.split("；") if st else []
-
-                highlight = (cid in self.current_highlights)
-                self._set_rank_row(i, left_text, status_parts, highlight=highlight)
-                self.row_cid_map[cid] = self.rank_rows[i]["frame"]
-
-            # 右侧日志渲染（最后一行加粗、死亡红名）
-            self.render_log_with_current_highlight(self.revealed_lines, self.revealed_hls)
-
-
-        def render_log_with_current_highlight(self, lines: List[str], hls: List[List[int]]):
-            """
-            - 所有行：若该行是【死亡】或【击杀】，则“被击败者名字(cid)”标红
-            - 当前行（最后一行）：该行涉及的角色名(cid)加粗（直播感）
-            """
-            self.log_text.configure(state="normal")
-            self.log_text.delete("1.0", tk.END)
-
-            # tag 配置（重复配置无害）
-            self.log_text.tag_configure("hl_current", font=self.font_log_bold)
-            self.log_text.tag_configure("victim_red", foreground="red")
-
-            last_i = len(lines) - 1
-
-            for i, line in enumerate(lines):
-                start_idx = self.log_text.index(tk.INSERT)
-                self.log_text.insert(tk.END, line + "\n")
-                end_idx = self.log_text.index(tk.INSERT)
-
-                # 1) 红名：被击败者
-                victim_cid = None
-                if i < len(self.revealed_victims):
-                    victim_cid = self.revealed_victims[i]
-                if victim_cid is not None and victim_cid in self.engine.roles:
-                    token_v = f"{self.engine.roles[victim_cid].name}({victim_cid})"
+        # 再填充
+        for i, cid in enumerate(rank):
+            info = status_map[cid]
+            st = info["brief"]
+            left_text = f"{i+1:>2}. {self._display_name(cid)}"
+            status_parts = st.split("；") if st else []
+            highlight = (cid in self.current_highlights)
+            self._row_name_fg = self.NPC_NAME_COLOR.get(cid)
+            self._set_rank_row(i, left_text, status_parts, highlight=highlight)
+            self._row_name_fg = None
+            r = i % rows_per_col
+            c = i // rows_per_col
+            self.rank_rows[i]["frame"].grid(row=r, column=c, sticky="ew", padx=(0, 8) if c == 0 else (8, 0), pady=1)
+        self.render_log_with_current_highlight(self.revealed_lines, self.revealed_hls)
+    def render_log_with_current_highlight(self, lines: List[str], hls: List[List[int]]):
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", tk.END)
+        self.log_text.tag_configure("hl_current", font=self.font_log_bold)
+        self.log_text.tag_configure("name_bold", font=self.font_log_bold)
+        self.log_text.tag_configure("victim_red", foreground="red")
+        self.log_text.tag_configure("event_gold", foreground="#D4AF37", font=self.font_log)
+        self.log_text.tag_configure("event_name_bold", foreground="#D4AF37", font=self.font_log_bold)
+        last_i = len(lines) - 1
+        for i, line in enumerate(lines):
+            start_idx = self.log_text.index(tk.INSERT)
+            line2 = self._rewrite_names_in_line(line)
+            # Normalize any extra spaces inside 【...】 to avoid '【Name 】' artifacts
+            line2 = re.sub(r"【[\s\u00A0\u3000]*([^】]*?)[\s\u00A0\u3000]*】", r"【\1】", line2)
+            disp_line = self._clean_log_text(line2)
+            disp_line = re.sub(r"【[\s\u00A0\u3000]*([^】]*?)[\s\u00A0\u3000]*】", r"【\1】", disp_line)
+            self.log_text.insert(tk.END, disp_line + "\n")
+            end_idx = self.log_text.index(tk.INSERT)
+            if "触发随机事件：" in line2:
+                # Only make the event name (【...】) bold; keep the rest in gold normal.
+                self.log_text.tag_add("event_gold", start_idx, end_idx)
+                try:
+                    lbr = line2.index("【")
+                    rbr = line2.index("】", lbr) + 1
+                    self.log_text.tag_add("event_name_bold", f"{start_idx}+{lbr}c", f"{start_idx}+{rbr}c")
+                except Exception:
+                    pass
+            victim_cid = self.revealed_victims[i] if i < len(self.revealed_victims) else None
+            if victim_cid is not None and victim_cid in self.engine.roles:
+                token_v = f"{self._display_name(victim_cid)}"
+                search_from = start_idx
+                while True:
+                    pos = self.log_text.search(token_v, search_from, stopindex=end_idx)
+                    if not pos:
+                        break
+                    pos_end = f"{pos}+{len(token_v)}c"
+                    self.log_text.tag_add("victim_red", pos, pos_end)
+                    search_from = pos_end
+            # Bold all names in this line
+            for cid2 in self.engine.roles.keys():
+                name2 = self._display_name(cid2)
+                if not name2:
+                    continue
+                search_from2 = start_idx
+                while True:
+                    pos2 = self.log_text.search(name2, search_from2, stopindex=end_idx)
+                    if not pos2:
+                        break
+                    pos2_end = f"{pos2}+{len(name2)}c"
+                    self.log_text.tag_add("name_bold", pos2, pos2_end)
+                    search_from2 = pos2_end
+            if i == last_i and i < len(hls):
+                for cid in hls[i]:
+                    if cid not in self.engine.roles:
+                        continue
+                    token = f"{self._display_name(cid)}"
                     search_from = start_idx
+                    while True:
+                        pos = self.log_text.search(token, search_from, stopindex=end_idx)
+                        if not pos:
+                            break
+                        pos_end = f"{pos}+{len(token)}c"
+                        self.log_text.tag_add("hl_current", pos, pos_end)
+                        search_from = pos_end
+        self.log_text.configure(state="disabled")
+        self.log_text.see(tk.END)
+    def _refresh_impl(self):
+        # 非回放状态：直接用 engine.log 全量显示
+        normal_bg = self.root.cget("bg")
+        alive = self.engine.alive_ids()
+        total = len(alive)
+        rows_per_col = max(1, math.ceil(total / 2))
+        for i in range(self.max_rows):
+
+            self.rank_rows[i]["name"].configure(text="", bg=normal_bg)
+            for w in self.rank_rows[i]["tags"].winfo_children():
+                w.destroy()
+        for i, cid in enumerate(alive):
+            r = self.engine.roles[cid]
+            st = r.status.brief()
+            left_text = f"{i+1:>2}. {self._display_name(cid)}"
+            status_parts = st.split("；") if st else []
+            self._row_name_fg = self.NPC_NAME_COLOR.get(cid)
+            self._set_rank_row(i, left_text, status_parts, highlight=False)
+            self._row_name_fg = None
+            rr = i % rows_per_col
+            cc = i // rows_per_col
+            self.rank_rows[i]["frame"].grid(row=rr, column=cc, sticky="ew", padx=(0, 8) if cc == 0 else (8, 0), pady=1)
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", tk.END)
+        joined = "\n".join(self._rewrite_names_in_line(x) for x in self.engine.log)
+        self.log_text.insert(tk.END, joined)
+        self.log_text.tag_configure("event_gold", foreground="#D4AF37", font=self.font_log)
+        self.log_text.tag_configure("event_name_bold", foreground="#D4AF37", font=self.font_log_bold)
+        start = "1.0"
+        while True:
+            pos = self.log_text.search("触发随机事件：", start, stopindex=tk.END)
+            if not pos:
+                break
+            line_start = pos.split(".")[0] + ".0"
+            line_end = pos.split(".")[0] + ".end"
+            self.log_text.tag_add("event_gold", line_start, line_end)
+            start = line_end
+        # event_gold_refresh
+        
+        # Apply bold styling to all names and red styling to victims in the displayed log.
+        for cid2 in self.engine.roles.keys():
+            name2 = self._display_name(cid2)
+            if not name2:
+                continue
+            search_from2 = "1.0"
+            while True:
+                pos2 = self.log_text.search(name2, search_from2, stopindex=tk.END)
+                if not pos2:
+                    break
+                pos2_end = f"{pos2}+{len(name2)}c"
+                self.log_text.tag_add("name_bold", pos2, pos2_end)
+                search_from2 = pos2_end
+
+        # Victim highlighting: parse each raw log line to find eliminated cid, then tag its (cleaned) display name red.
+        raw_lines = list(self.engine.log)
+        disp_lines = [self._clean_log_text(x) for x in raw_lines]
+        # Build start indices of each displayed line in the Text widget
+        line_start_idx = "1.0"
+        for raw_line, disp_line in zip(raw_lines, disp_lines):
+            victim_cid = self._parse_victim_cid(raw_line)
+            if victim_cid is not None and victim_cid in self.engine.roles:
+                token_v = self._display_name(victim_cid)
+                if token_v:
+                    # restrict search within this line only
+                    end_idx = f"{line_start_idx} lineend"
+                    search_from = line_start_idx
                     while True:
                         pos = self.log_text.search(token_v, search_from, stopindex=end_idx)
                         if not pos:
@@ -2137,68 +3806,29 @@ if TK_AVAILABLE:
                         pos_end = f"{pos}+{len(token_v)}c"
                         self.log_text.tag_add("victim_red", pos, pos_end)
                         search_from = pos_end
+            # advance to next line
+            line_start_idx = f"{line_start_idx} +1line"
 
-                # 2) 当前行加粗：涉及角色
-                if i == last_i and i < len(hls):
-                    for cid in hls[i]:
-                        if cid not in self.engine.roles:
-                            continue
-                        token = f"{self.engine.roles[cid].name}({cid})"
-                        search_from = start_idx
-                        while True:
-                            pos = self.log_text.search(token, search_from, stopindex=end_idx)
-                            if not pos:
-                                break
-                            pos_end = f"{pos}+{len(token)}c"
-                            self.log_text.tag_add("hl_current", pos, pos_end)
-                            search_from = pos_end
+        self.log_text.configure(state="disabled")
+        self.log_text.see(tk.END)
 
-            self.log_text.configure(state="disabled")
-            self.log_text.see(tk.END)
+    def refresh(self):
+        # Debounced refresh to avoid visible flicker when the UI updates rapidly.
+        if getattr(self, "_refresh_scheduled", None):
+            return
+        self._refresh_scheduled = self.root.after_idle(self._do_refresh)
 
-        def on_next(self):
-            # 回合推进前：更新连续存活/死亡回合计数（给梅雨神等使用）
-            self.engine.tick_alive_turns()
-            self.engine.next_turn()
-            self.refresh()
+    def _do_refresh(self):
+        self._refresh_scheduled = None
+        try:
+            self._refresh_impl()
+        except Exception:
+            import traceback
+            traceback.print_exc()
 
-        def refresh(self):
-            # 使用“行池”，不要 destroy 预建的 26 行
-            normal_bg = self.root.cget("bg")
-
-            # 先清空26行显示
-            for i in range(26):
-                row = self.rank_rows[i]["frame"]
-                name_lbl = self.rank_rows[i]["name"]
-                tags_frame = self.rank_rows[i]["tags"]
-
-                row.configure(bg=normal_bg)
-                name_lbl.configure(text="", bg=normal_bg)
-
-                for w in tags_frame.winfo_children():
-                    w.destroy()
-                tags_frame.configure(bg=normal_bg)
-
-            # 再填充存活排名
-            alive = self.engine.alive_ids()
-            self.row_cid_map = {}
-
-            for i, cid in enumerate(alive):
-                r = self.engine.roles[cid]
-                st = r.status.brief()
-                left_text = f"{i+1:>2}. {r.name}({cid})"
-                status_parts = st.split("；") if st else []
-
-                self._set_rank_row(i, left_text, status_parts, highlight=False)
-                self.row_cid_map[cid] = self.rank_rows[i]["frame"]
-
-            # 右侧日志（全量显示）
-            self.log_text.configure(state="normal")
-            self.log_text.delete("1.0", tk.END)
-            self.log_text.insert(tk.END, "\n".join(self.engine.log))
-            self.log_text.configure(state="disabled")
-            self.log_text.see(tk.END)
-    def main():
+def main():
+    set_dpi_awareness()
+    try:
         root = tk.Tk()
         try:
             ttk.Style().theme_use("clam")
@@ -2206,12 +3836,13 @@ if TK_AVAILABLE:
             pass
         UI(root)
         root.mainloop()
+    except Exception:
+        import traceback
+        tb = traceback.format_exc()
+        try:
+            messagebox.showerror("Program crashed", tb)
+        except Exception:
+            print(tb)
 
-    if __name__ == "__main__":
-        main()
-else:
-    def main():
-        raise RuntimeError("当前环境不支持 Tkinter（缺少 _tkinter）。请运行网页版。")
-
-    if __name__ == "__main__":
-        main()
+if __name__ == "__main__":
+    main()

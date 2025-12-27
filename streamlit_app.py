@@ -3,6 +3,7 @@ import time
 import importlib
 import streamlit as st
 
+st.write("UI VERSION: v3-2025-12-27")
 st.set_page_config(page_title="神秘游戏", layout="wide")
 
 # ----------------------------

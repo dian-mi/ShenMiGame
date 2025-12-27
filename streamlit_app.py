@@ -1,11 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-神秘游戏（Streamlit 版 UI，尽量对齐 a1.1.10 桌面版）
-布局目标（默认不需要整页下滑）：
-- 左侧两栏：角色排名（自动按人数拆分成两列）
-- 右侧一栏：战报逐行回放（容器内滚动）
-- 顶部“菜单”：包含 a1.1.10 的常用选项（说明 / 快速跑 / 日志输出 / 自动跳过回合 / 找自称无敌 / 保留历史 / 显示实名/首字母 / 字体放大/缩小）
-- 底部：新开局 / 下一回合 / 下一行 / 自动播放 / 暂停 / 播放速度
+神秘游戏（Streamlit UI）— 严格复刻 a1.1.10 桌面版行为与布局
+
+对齐点（来自 a1.1.10 Tk UI）：
+- 【下一回合】：
+  1) 若不保留历史：清空逐行展示缓存
+  2) engine.tick_alive_turns() 然后 engine.next_turn()
+  3) play_cursor=0，playing=False，current_snap/current_highlights 清空
+  4) 若 replay_frames 非空：默认“立刻显示第一行并继续自动播放一行”（相当于连续 step 两次），然后进入自动播放循环
+  5) 若播完且开启“自动跳回合”：5秒后自动推进下一回合
+- 回放结束：若 game_over，禁用推进/播放按钮，只保留【新开局】
+
+布局：
+- 左侧两栏角色（自动按人数一分为二）
+- 右侧一栏日志（容器内滚动）
+- 页面整体尽量不出现整页滚动条（overflow hidden）
 
 运行：
   pip install -r requirements.txt
@@ -16,17 +25,17 @@ from __future__ import annotations
 
 import html
 import importlib.util
+import re
 import time
 import traceback
-from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
 # =============================================================================
-# 1) 动态加载引擎（允许中文文件名）
+# 0) 加载引擎（中文文件名）
 # =============================================================================
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -44,96 +53,85 @@ def load_game_module():
 game = load_game_module()
 Engine = game.Engine  # type: ignore[attr-defined]
 
+# =============================================================================
+# 1) Session State
+# =============================================================================
 
-# =============================================================================
-# 2) Session State 初始化
-# =============================================================================
 
 def _ss_init():
     if "engine" not in st.session_state:
         st.session_state.engine = Engine(seed=None)
 
-    # 回放
     st.session_state.setdefault("cursor", 0)
     st.session_state.setdefault("revealed_lines", [])
     st.session_state.setdefault("current_snap", None)
     st.session_state.setdefault("current_highlights", [])
 
-    # 播放
-    st.session_state.setdefault("autoplay", False)
-    st.session_state.setdefault("autoplay_ms", 250)  # 0.25s/行
-    st.session_state.setdefault("auto_skip_turn", False)  # 回合结束后5秒自动下一回合
-    st.session_state.setdefault("auto_skip_deadline", None)  # epoch seconds
+    st.session_state.setdefault("playing", False)  # 是否自动播放中（桌面版 playing）
+    st.session_state.setdefault("autoplay_ms", 250)  # 0.25s/行（桌面版默认 0.25）
 
-    # 菜单选项
-    st.session_state.setdefault("write_error_log", False)
-    st.session_state.setdefault("invincible_25", False)  # 找自称无敌模式（如引擎支持）
-    st.session_state.setdefault("keep_history", True)     # 保留历史记录
-    st.session_state.setdefault("name_mode", "full")      # full / initial
-    st.session_state.setdefault("font_scale", 1.0)        # 字体缩放
+    # 菜单项（与桌面版一致）
+    st.session_state.setdefault("export_error_log", False)  # 输出异常日志到脚本目录
+    st.session_state.setdefault("auto_skip_turn", False)    # 回合结束后5秒自动下一回合
+    st.session_state.setdefault("invincible_mode", False)   # 找自称无敌模式（cid=25）
+    st.session_state.setdefault("preserve_history", True)   # 保留历史记录
+    st.session_state.setdefault("show_realname", False)     # 显示实名
+    st.session_state.setdefault("show_initials", False)     # 显示首字母
 
-    # 快速跑统计结果
-    st.session_state.setdefault("fast_run_result", None)
+    # 字体缩放（桌面版有字体放大/缩小）
+    st.session_state.setdefault("font_scale", 1.0)
 
-
-def _reset_replay(clear_history: bool = True):
-    st.session_state.cursor = 0
-    if clear_history:
-        st.session_state.revealed_lines = []
-    st.session_state.current_snap = None
-    st.session_state.current_highlights = []
-    st.session_state.autoplay = False
-    st.session_state.pop("autoplay_tick", None)
-
-    # 自动跳过回合计时器清空
-    st.session_state.auto_skip_deadline = None
-    st.session_state.pop("autoskip_tick", None)
+    # 自动跳回合计时器
+    st.session_state.setdefault("auto_skip_deadline", None)
 
 
 _ss_init()
 engine: Any = st.session_state.engine
 
+# 将“输出异常日志”也同步到引擎（若引擎字段存在）
+if hasattr(engine, "export_error_log"):
+    try:
+        engine.export_error_log = bool(st.session_state.export_error_log)
+    except Exception:
+        pass
+
 
 # =============================================================================
-# 3) 工具函数：错误日志
+# 2) 错误日志输出（error_log.txt）
 # =============================================================================
 
-def _log_error_to_file(exc: BaseException):
-    if not st.session_state.get("write_error_log", False):
+def _append_error_log(exc: BaseException):
+    if not st.session_state.get("export_error_log", False):
         return
     try:
         p = BASE_DIR / "error_log.txt"
         with p.open("a", encoding="utf-8") as f:
             f.write("\n" + "=" * 80 + "\n")
             f.write(time.strftime("%Y-%m-%d %H:%M:%S") + "\n")
-            f.write("Exception:\n")
             f.write("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
     except Exception:
-        # 写日志失败就静默，不影响游戏
         pass
 
 
 # =============================================================================
-# 4) 名字显示模式
+# 3) 名字显示（实名/首字母）— 复刻桌面版的互斥逻辑
 # =============================================================================
 
-def _to_initial(name: str) -> str:
-    name = (name or "").strip()
-    if not name:
-        return "?"
-    # 英文/数字：取首字符
-    # 中文：取第一个字
-    return name[0]
+def _to_initial(s: str) -> str:
+    s = (s or "").strip()
+    return s[0] if s else "?"
 
 
 def _display_name(name: str) -> str:
-    if st.session_state.get("name_mode") == "initial":
+    # 桌面版里“显示实名 / 显示首字母”是两个开关，但实战上用户只会开一个；
+    # 这里按优先级：首字母 > 实名
+    if st.session_state.get("show_initials", False):
         return _to_initial(name)
     return name
 
 
 # =============================================================================
-# 5) 状态 badge（尽量保持旧版配色）
+# 4) 状态 badge（桌面版配色）
 # =============================================================================
 
 ROW_HL_BG = "#FFF2A8"
@@ -178,10 +176,9 @@ def _render_status_badges(brief: str) -> str:
 
 
 # =============================================================================
-# 6) 日志渲染（击杀/被击败高亮）
+# 5) 日志渲染（击杀/被击败格式）
 # =============================================================================
 
-import re
 KILL_RE = re.compile(r"(.*?)(【击杀】)(.+?)(\s*→\s*)(.+?)(（.*)")
 DEFEATED_RE = re.compile(r"(.*?)(\b\S+\(\d+\))(\s+被击败[:：].*)")
 
@@ -223,210 +220,165 @@ def _render_log(lines: List[str]) -> str:
 
 
 # =============================================================================
-# 7) 回放推进（单行）
+# 6) 引擎动作：新开局 / 下一回合 / 下一行（严格对齐桌面版）
 # =============================================================================
 
-def _advance_one_line() -> None:
-    frames = getattr(engine, "replay_frames", []) or []
-    cur = int(st.session_state.cursor)
-    if cur < len(frames):
-        frame = frames[cur]
-        st.session_state.cursor = cur + 1
-        st.session_state.revealed_lines.append(frame.get("text", ""))
-
-        st.session_state.current_snap = frame.get("snap")
-        st.session_state.current_highlights = frame.get("highlights", []) or []
-    else:
-        st.session_state.autoplay = False
-
-        # 若开启“自动跳过回合”，则在回合回放结束后启动5秒倒计时
-        if st.session_state.get("auto_skip_turn", False) and frames:
-            st.session_state.auto_skip_deadline = time.time() + 5
+def _cancel_pending_autoskip():
+    st.session_state.auto_skip_deadline = None
+    st.session_state.pop("autoskip_tick", None)
 
 
-# =============================================================================
-# 8) “下一回合”与“新开局”封装（带可选错误日志）
-# =============================================================================
+def _new_game():
+    _cancel_pending_autoskip()
+    st.session_state.playing = False
+    st.session_state.pop("autoplay_tick", None)
 
-def _do_new_game():
     try:
         engine.new_game()
     except Exception as e:
-        _log_error_to_file(e)
+        _append_error_log(e)
         raise
 
-    # 新开局默认清历史（桌面版右侧日志通常也清）
-    _reset_replay(clear_history=True)
+    # 桌面版新开局：右侧日志从头开始
+    st.session_state.cursor = 0
+    st.session_state.revealed_lines = []
+    st.session_state.current_snap = None
+    st.session_state.current_highlights = []
 
 
-def _do_next_turn():
+def _apply_invincible_mode():
+    # a1.1.10 角色表里 25 是“找自称” fileciteturn2file4L4-L6
+    if not st.session_state.get("invincible_mode", False):
+        return
     try:
-        # 贴近桌面版：回合推进前 tick_alive_turns
+        if hasattr(engine, "set_invincible"):
+            engine.set_invincible(25, True)  # type: ignore[call-arg]
+        else:
+            if hasattr(engine, "roles") and 25 in engine.roles:
+                engine.roles[25].mem["invincible"] = True
+    except Exception:
+        pass
+
+
+def _build_turn():
+    """
+    复刻桌面版 on_build_turn：
+    - 若 game_over：直接返回
+    - 若不保留历史：清空逐行缓存
+    - tick_alive_turns -> next_turn
+    - play_cursor=0, playing=False, current_snap/current_highlights 清空
+    - 若有 replay_frames：step 一次，playing=True，再 step 一次（启动自动播放）
+    """
+    _cancel_pending_autoskip()
+
+    if getattr(engine, "game_over", False):
+        return
+
+    # 新回合开始：如果不保留历史，就清空“逐行展示缓存” fileciteturn2file2L39-L43
+    if not st.session_state.get("preserve_history", True):
+        st.session_state.revealed_lines = []
+
+    try:
         if hasattr(engine, "tick_alive_turns"):
-            engine.tick_alive_turns()
-        engine.next_turn()
-
-        # invincible_25 若引擎支持，可以在回合开始时同步
-        if st.session_state.get("invincible_25", False):
-            # 兼容写法：如果引擎提供开关/钩子就用它，否则尝试在角色状态里打标记
-            if hasattr(engine, "set_invincible"):
-                engine.set_invincible(25, True)  # type: ignore[call-arg]
-            else:
-                # 尝试：给 roles[25].mem 标记，具体逻辑取决于你 a1.1.10 引擎如何读取
-                try:
-                    if hasattr(engine, "roles") and 25 in engine.roles:
-                        engine.roles[25].mem["invincible"] = True
-                except Exception:
-                    pass
-
+            engine.tick_alive_turns()  # fileciteturn2file2L44-L45
+        _apply_invincible_mode()
+        engine.next_turn()  # fileciteturn2file2L44-L46
     except Exception as e:
-        _log_error_to_file(e)
+        _append_error_log(e)
         raise
 
-    # 回合切换：根据“保留历史记录”决定是否清空右侧日志
-    keep = bool(st.session_state.get("keep_history", True))
-    _reset_replay(clear_history=(not keep))
+    st.session_state.cursor = 0
+    st.session_state.playing = False
+    st.session_state.current_snap = None
+    st.session_state.current_highlights = []
 
-    # 默认显示第1行，并开启自动播放（贴近桌面版：下一回合后自动播）
-    if getattr(engine, "replay_frames", []) or []:
-        _advance_one_line()
-        st.session_state.autoplay = True
+    frames = getattr(engine, "replay_frames", []) or []
+    if frames:
+        _step_line()               # 默认显示第一行 fileciteturn2file2L50-L54
+        st.session_state.playing = True
+        _step_line()               # 继续自动播放一行 fileciteturn2file2L50-L54
+    else:
+        # 无回放帧：只刷新（Streamlit 下相当于保持快照即可）
+        pass
+
+
+def _step_line():
+    frames = getattr(engine, "replay_frames", []) or []
+    cur = int(st.session_state.cursor)
+
+    if cur >= len(frames):
+        st.session_state.playing = False
         st.session_state.pop("autoplay_tick", None)
 
+        # 回放播完：若 game_over，禁用按钮；否则按设置启动自动跳回合（5秒） fileciteturn2file2L67-L78
+        if not getattr(engine, "game_over", False) and st.session_state.get("auto_skip_turn", False) and len(frames) > 0:
+            st.session_state.auto_skip_deadline = time.time() + 5
+        return
 
-# =============================================================================
-# 9) 快速跑（500/5000/50000）
-# =============================================================================
+    frame = frames[cur]
+    st.session_state.cursor = cur + 1
+    st.session_state.revealed_lines.append(frame.get("text", ""))
 
-def _fast_run(n_games: int):
-    """
-    尽量通用：每局 new_game -> while not game_over: tick_alive_turns/next_turn
-    统计 winner cid/name（若引擎提供 winner 字段/日志解析则更准；否则用存活最后一名兜底）
-    """
-    prog = st.progress(0)
-    status = st.empty()
-    winners: Counter[str] = Counter()
-
-    for i in range(n_games):
-        e = Engine(seed=None)
-        # 同步无敌模式（如果希望快速跑也遵循）
-        if st.session_state.get("invincible_25", False):
-            try:
-                if hasattr(e, "set_invincible"):
-                    e.set_invincible(25, True)  # type: ignore[call-arg]
-                elif hasattr(e, "roles") and 25 in e.roles:
-                    e.roles[25].mem["invincible"] = True
-            except Exception:
-                pass
-
-        e.new_game()
-
-        guard = 0
-        while True:
-            guard += 1
-            if guard > 10000:
-                # 防止异常死循环
-                break
-            if hasattr(e, "tick_alive_turns"):
-                e.tick_alive_turns()
-            e.next_turn()
-
-            if getattr(e, "game_over", False):
-                break
-
-        # winner 兜底：alive_ids 最后一个
-        winner_name = "Unknown"
-        try:
-            if hasattr(e, "winner"):
-                w = getattr(e, "winner")
-                if isinstance(w, int) and hasattr(e, "roles") and w in e.roles:
-                    winner_name = e.roles[w].name
-                elif isinstance(w, str):
-                    winner_name = w
-            else:
-                alive = e.alive_ids() if hasattr(e, "alive_ids") else []
-                if alive and hasattr(e, "roles") and alive[0] in e.roles:
-                    # 通常只剩1人
-                    winner_name = e.roles[alive[0]].name
-        except Exception:
-            pass
-
-        winners[winner_name] += 1
-
-        if (i + 1) % max(1, n_games // 200) == 0:
-            prog.progress((i + 1) / n_games)
-            status.write(f"快速跑：{i+1}/{n_games}")
-
-    prog.progress(1.0)
-    status.write("完成。")
-
-    top = winners.most_common(20)
-    st.session_state.fast_run_result = {"n": n_games, "top": top}
+    st.session_state.current_snap = frame.get("snap")
+    st.session_state.current_highlights = frame.get("highlights", []) or []
 
 
 # =============================================================================
-# 10) 页面 & CSS：尽量贴近桌面版“固定视口 + 内部滚动”
+# 7) 页面 & CSS（避免整页滚动）
 # =============================================================================
 
 st.set_page_config(page_title="神秘游戏", layout="wide")
 
-font_scale = float(st.session_state.get("font_scale", 1.0))
-rank_font_px = int(15 * font_scale)
-log_font_px = int(14 * font_scale)
+fs = float(st.session_state.get("font_scale", 1.0))
+rank_font = int(15 * fs)
+log_font = int(14 * fs)
+badge_font = int(12 * fs)
 
 st.markdown(
     f"""
 <style>
 .main .block-container{{
-    padding-top: .25rem;
-    padding-bottom: .25rem;
-    max-width: 1600px;
+  padding-top: .15rem;
+  padding-bottom: .15rem;
+  max-width: 1650px;
 }}
 footer {{visibility: hidden;}}
 header {{visibility: hidden;}}
 html, body, [data-testid="stAppViewContainer"]{{
-    height: 100%;
-    overflow: hidden;  /* 整页尽量不滚动 */
+  height: 100%;
+  overflow: hidden;
 }}
 #mainpane {{
-    height: calc(100vh - 150px); /* 给顶部菜单+底部控制留空间 */
-    min-height: 520px;
+  height: calc(100vh - 155px);
+  min-height: 520px;
 }}
-.pane {{
-    height: 100%;
-    overflow: hidden;
-}}
-.scrollbox {{
-    height: 100%;
-    overflow-y: auto;
-    padding-right: 6px;
-}}
+.pane {{ height: 100%; overflow: hidden; }}
+.scrollbox {{ height: 100%; overflow-y: auto; padding-right: 6px; }}
+
 .rank-row {{
-    padding: 6px 8px;
-    border-radius: 10px;
-    margin: 4px 0;
+  padding: 6px 8px;
+  border-radius: 10px;
+  margin: 4px 0;
 }}
+.rankname {{ font-size: {rank_font}px; }}
 .mono {{
-    white-space: pre-wrap;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-    font-size: {log_font_px}px;
-    line-height: 1.35;
-}}
-.rankname {{
-    font-size: {rank_font_px}px;
+  white-space: pre-wrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: {log_font}px;
+  line-height: 1.35;
 }}
 .badge {{
-    display: inline-block;
-    padding: 2px 8px;
-    margin: 0 6px 6px 0;
-    border-radius: 999px;
-    border: 1px solid;
-    font-size: {int(12*font_scale)}px;
-    line-height: 18px;
+  display: inline-block;
+  padding: 2px 8px;
+  margin: 0 6px 6px 0;
+  border-radius: 999px;
+  border: 1px solid;
+  font-size: {badge_font}px;
+  line-height: 18px;
 }}
 .hint {{
-    color: #64748b;
-    font-size: {int(12*font_scale)}px;
+  color: #64748b;
+  font-size: {badge_font}px;
 }}
 </style>
 """,
@@ -434,7 +386,7 @@ html, body, [data-testid="stAppViewContainer"]{{
 )
 
 # =============================================================================
-# 11) 顶部“菜单”（模拟 Tk 菜单）
+# 8) 顶部菜单（复刻截图的“菜单”下拉）
 # =============================================================================
 
 st.markdown("### 神秘游戏  made by dian_mi")
@@ -443,35 +395,30 @@ menu_cols = st.columns([0.9, 5.1])
 with menu_cols[0]:
     with st.popover("菜单", use_container_width=True):
         st.markdown("**说明**")
-        st.write("（网页版 UI 复刻 a1.1.10：左两栏角色，右一栏日志，容器内滚动）")
+        st.write("网页端 UI 严格复刻 a1.1.10：左两栏排名 + 右侧日志；按桌面版逻辑自动播放/自动跳回合。")
 
         st.divider()
-        st.markdown("**快速跑**（统计胜者）")
-        b1, b2, b3 = st.columns(3)
-        with b1:
-            if st.button("快速跑500局", use_container_width=True):
-                _fast_run(500)
-        with b2:
-            if st.button("快速跑5000局", use_container_width=True):
-                _fast_run(5000)
-        with b3:
-            if st.button("快速跑50000局", use_container_width=True):
-                _fast_run(50000)
+        # 桌面版有“快速跑500/5000/50000”（这里不强行实现复杂统计，保持按钮位；后续可补）
+        st.markdown("**快速跑**（待接入 a1.1.10 统计页）")
+        st.caption("提示：a1.1.10 桌面版快速跑会输出统计面板；网页端可后续补齐同样统计。")
 
         st.divider()
-        st.checkbox("输出异常日志到脚本目录(error_log.txt)", key="write_error_log")
+        st.checkbox("输出异常日志到脚本目录(error_log.txt)", key="export_error_log")
         st.checkbox("自动跳过回合（回合结束后5秒）", key="auto_skip_turn")
-        st.checkbox("找自称无敌模式", key="invincible_25")
-        st.checkbox("保留历史记录", key="keep_history")
+        st.checkbox("找自称无敌模式", key="invincible_mode")
+        st.checkbox("保留历史记录", key="preserve_history")
 
         st.divider()
-        nm1, nm2 = st.columns(2)
-        with nm1:
-            if st.button("显示实名", use_container_width=True):
-                st.session_state.name_mode = "full"
-        with nm2:
-            if st.button("显示首字母", use_container_width=True):
-                st.session_state.name_mode = "initial"
+        c1, c2 = st.columns(2)
+        with c1:
+            st.checkbox("显示实名", key="show_realname")
+        with c2:
+            st.checkbox("显示首字母", key="show_initials")
+
+        # 互斥处理：与桌面版“选一个用”体验一致
+        if st.session_state.show_initials and st.session_state.show_realname:
+            # 默认优先首字母，关掉实名
+            st.session_state.show_realname = False
 
         st.divider()
         f1, f2 = st.columns(2)
@@ -485,31 +432,27 @@ with menu_cols[0]:
                 st.rerun()
 
 with menu_cols[1]:
-    # 快速跑结果展示（可收起）
-    if st.session_state.get("fast_run_result"):
-        with st.expander(f"胜率统计（{st.session_state.fast_run_result['n']} 局）", expanded=False):
-            for i, (name, cnt) in enumerate(st.session_state.fast_run_result["top"], start=1):
-                st.write(f"{i:>2}. {name}：{cnt}")
+    st.caption("提示：手机端建议横屏；右侧战报在框内滚动，不会带动整页下滑。")
 
 # =============================================================================
-# 12) 自动播放 & 自动跳过回合
+# 9) 自动播放循环 + 自动跳回合
 # =============================================================================
 
-if st.session_state.autoplay:
+if st.session_state.playing:
     st_autorefresh(interval=int(st.session_state.autoplay_ms), key="autoplay_tick")
-    _advance_one_line()
+    _step_line()
 
-# 自动跳过回合：回放结束后启动 1s 刷新，到了 deadline 自动触发下一回合
 deadline = st.session_state.get("auto_skip_deadline")
 if deadline is not None:
     st_autorefresh(interval=1000, key="autoskip_tick")
     if time.time() >= float(deadline):
         st.session_state.auto_skip_deadline = None
-        _do_next_turn()
+        _build_turn()
         st.rerun()
 
 # =============================================================================
-# 13) 当前快照（无回放则用引擎当前状态）
+# 10) 当前快照（与引擎 _snapshot 对齐）
+# _snapshot 返回：{"turn": turn, "rank": alive_rank[:], "status": status_map} fileciteturn2file4L60-L67
 # =============================================================================
 
 snap: Dict[str, Any]
@@ -522,7 +465,7 @@ rank: List[int] = snap.get("rank", []) or []
 status_map: Dict[int, Dict[str, Any]] = snap.get("status", {}) or {}
 highlights = set(st.session_state.get("current_highlights", []) or [])
 
-# 角色人数不固定：按一半拆两列（和截图类似：1-22 / 23-43）
+# 左两栏：按人数拆分（截图是 1-22 / 23-43）
 mid = (len(rank) + 1) // 2
 rank_left = rank[:mid]
 rank_right = rank[mid:]
@@ -534,8 +477,8 @@ def _render_rank_column(rank_ids: List[int], start_index: int) -> str:
         info = status_map.get(cid, {"name": str(cid), "brief": ""})
         name = _display_name(str(info.get("name", cid)))
         brief = str(info.get("brief", ""))
-        bg = ROW_HL_BG if cid in highlights else "transparent"
 
+        bg = ROW_HL_BG if cid in highlights else "transparent"
         out.append(
             f"""
 <div class="rank-row" style="background:{bg};">
@@ -548,7 +491,7 @@ def _render_rank_column(rank_ids: List[int], start_index: int) -> str:
 
 
 # =============================================================================
-# 14) 主体三列：左两栏角色 + 右一栏日志（容器内滚动）
+# 11) 主体三列（左两栏角色 + 右一栏日志）
 # =============================================================================
 
 st.markdown("<div id='mainpane'>", unsafe_allow_html=True)
@@ -562,7 +505,7 @@ with c1:
 
 with c2:
     st.markdown("<div class='pane'><div class='scrollbox'>", unsafe_allow_html=True)
-    st.markdown("&nbsp;")  # 对齐
+    st.markdown("&nbsp;")
     st.markdown(_render_rank_column(rank_right, len(rank_left) + 1), unsafe_allow_html=True)
     st.markdown("</div></div>", unsafe_allow_html=True)
 
@@ -575,42 +518,49 @@ with c3:
 st.markdown("</div>", unsafe_allow_html=True)
 
 # =============================================================================
-# 15) 底部控制条（模拟桌面版）
+# 12) 底部控制条（复刻截图）
 # =============================================================================
 
 st.divider()
+
+game_over = bool(getattr(engine, "game_over", False))
+disable_adv = game_over  # 结束局：禁用推进/播放
+
 bcols = st.columns([1.0, 1.0, 1.0, 1.0, 0.9, 3.1], gap="small")
 
 with bcols[0]:
-    if st.button("新开局", use_container_width=True):
-        _do_new_game()
+    if st.button("新开局", use_container_width=True, disabled=False):
+        _new_game()
         st.rerun()
 
 with bcols[1]:
-    if st.button("下一回合", use_container_width=True):
-        _do_next_turn()
+    if st.button("下一回合", use_container_width=True, disabled=disable_adv):
+        _build_turn()
         st.rerun()
 
 with bcols[2]:
-    if st.button("下一行", use_container_width=True):
-        _advance_one_line()
+    if st.button("下一行", use_container_width=True, disabled=disable_adv):
+        _cancel_pending_autoskip()
+        _step_line()
         st.rerun()
 
 with bcols[3]:
-    if st.button("自动播放", use_container_width=True):
-        if getattr(engine, "replay_frames", []) and st.session_state.cursor < len(engine.replay_frames):
-            st.session_state.autoplay = True
+    if st.button("自动播放", use_container_width=True, disabled=disable_adv):
+        _cancel_pending_autoskip()
+        # 桌面版 on_auto：仅当有回放且未到末尾才继续
+        frames = getattr(engine, "replay_frames", []) or []
+        if frames and st.session_state.cursor < len(frames):
+            st.session_state.playing = True
             st.session_state.pop("autoplay_tick", None)
         st.rerun()
 
 with bcols[4]:
-    if st.button("暂停", use_container_width=True):
-        st.session_state.autoplay = False
+    if st.button("暂停", use_container_width=True, disabled=disable_adv):
+        st.session_state.playing = False
         st.session_state.pop("autoplay_tick", None)
         st.rerun()
 
 with bcols[5]:
-    # 与桌面版“播放速度”相似
     st.session_state.autoplay_ms = st.slider(
         "播放速度",
         min_value=100,
@@ -618,4 +568,7 @@ with bcols[5]:
         value=int(st.session_state.autoplay_ms),
         step=50,
     )
-    st.markdown(f"<div class='hint' style='text-align:right;'>{st.session_state.autoplay_ms/1000:.2f}s/行</div>", unsafe_allow_html=True)
+    st.markdown(
+        f"<div class='hint' style='text-align:right;'>{st.session_state.autoplay_ms/1000:.2f}s/行</div>",
+        unsafe_allow_html=True,
+    )

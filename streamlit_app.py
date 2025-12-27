@@ -1,54 +1,55 @@
 # -*- coding: utf-8 -*-
-import time
 import importlib
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
-st.set_page_config(page_title="神秘游戏", layout="wide")  # ✅ 必须第一条 st.* 命令
+# IMPORTANT: set_page_config must be the first Streamlit command.
+st.set_page_config(page_title="神秘游戏", layout="wide")
 
-st.write("UI VERSION: v3-2025-12-27")  # ✅ 放到这里就不会报错了
-
+UI_VERSION = "v4-2025-12-27"
 
 # ----------------------------
 # CSS: emulate a1.1.10 (3 panels, list rows, separators, selected yellow)
 # No page scrolling; panels scroll internally.
 # ----------------------------
-st.markdown("""
+st.markdown(f"""
 <style>
-  :root{
+  :root{{
     --bg: #efefef;
     --panel: #f7f7f7;
     --line: #d7d7d7;
     --text: #111;
     --muted: #666;
     --select: #fff3b0;
-  }
-  html, body, [data-testid="stAppViewContainer"] { height: 100%; overflow: hidden; background: var(--bg); }
-  [data-testid="stAppViewContainer"] > .main { height: 100%; overflow: hidden; background: var(--bg); }
-  .block-container { padding-top: 0.4rem; padding-bottom: 0.4rem; max-width: 100%; }
-  header { visibility: hidden; height: 0px; }
+  }}
+  html, body, [data-testid="stAppViewContainer"] {{ height: 100%; overflow: hidden; background: var(--bg); }}
+  [data-testid="stAppViewContainer"] > .main {{ height: 100%; overflow: hidden; background: var(--bg); }}
+  .block-container {{ padding-top: 0.35rem; padding-bottom: 0.35rem; max-width: 100%; }}
+  header {{ visibility: hidden; height: 0px; }}
+  [data-testid="stToolbar"] {{ visibility: visible; }}
 
-  .nb-wrap { height: calc(100vh - 130px); }
-  .nb-panel {
+  .nb-wrap {{ height: calc(100vh - 150px); }}
+  .nb-panel {{
     background: var(--panel);
     border: 1px solid var(--line);
     border-radius: 0px;
     height: 100%;
     overflow: hidden;
-  }
-  .nb-panel-title{
+  }}
+  .nb-panel-title{{
     font-weight: 700;
     padding: 8px 10px;
     border-bottom: 1px solid var(--line);
     color: var(--text);
     background: #f3f3f3;
-  }
-  .nb-scroll{
+  }}
+  .nb-scroll{{
     height: calc(100% - 41px);
     overflow-y: auto;
-  }
+  }}
 
   /* Role rows */
-  .role-row{
+  .role-row{{
     display:flex;
     align-items:center;
     justify-content:space-between;
@@ -57,45 +58,43 @@ st.markdown("""
     font-size: 16px;
     color: var(--text);
     background: transparent;
-  }
-  .role-left{
+  }}
+  .role-left{{
     display:flex;
     gap: 8px;
     align-items:center;
     min-width: 0;
-  }
-  .role-idx{ width: 28px; color: var(--text); font-weight: 700; }
-  .role-name{ white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .role-right{ display:flex; gap: 10px; align-items:center; }
-  .sttok{
+  }}
+  .role-idx{{ width: 30px; color: var(--text); font-weight: 700; }}
+  .role-name{{ white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+  .role-right{{ display:flex; gap: 10px; align-items:center; }}
+  .sttok{{
     display:inline-block;
     padding: 2px 8px;
     border-radius: 999px;
     font-size: 14px;
-    border: 1px solid rgba(0,0,0,0.08);
+    border: 1px solid rgba(0,0,0,0.10);
     background: rgba(0,0,0,0.03);
     color: var(--text);
-  }
-  .selected{ background: var(--select); }
-  .dead{ opacity: 0.45; text-decoration: line-through; }
+  }}
+  .selected{{ background: var(--select); }}
+  .dead{{ opacity: 0.45; text-decoration: line-through; }}
 
   /* Log */
-  .log-line{
+  .log-line{{
     padding: 3px 10px;
     font-size: 16px;
     line-height: 1.25;
     color: var(--text);
     white-space: pre-wrap;
-  }
-  .log-empty{ color: var(--muted); }
+  }}
+  .log-empty{{ color: var(--muted); }}
 
-  /* Control bar */
-  .ctrlbar{
-    display:flex;
-    gap: 8px;
-    align-items:center;
-    padding: 6px 0 2px 0;
-  }
+  /* Slightly tighter buttons like desktop */
+  .stButton>button {{
+    height: 42px;
+    border-radius: 6px;
+  }}
 </style>
 """, unsafe_allow_html=True)
 
@@ -117,13 +116,21 @@ engine = load_engine()
 # ----------------------------
 if "speed" not in st.session_state:
     st.session_state.speed = 0.25
-if "snap" not in st.session_state:
-    st.session_state.snap = None
 if "selected_cid" not in st.session_state:
     st.session_state.selected_cid = None
 
+# Animation state (non-blocking, avoids time.sleep)
+if "playing" not in st.session_state:
+    st.session_state.playing = False
+if "frame_i" not in st.session_state:
+    st.session_state.frame_i = 0
+if "turn_start_log_len" not in st.session_state:
+    st.session_state.turn_start_log_len = 0
+if "turn_frames" not in st.session_state:
+    st.session_state.turn_frames = []
+
 # ----------------------------
-# Status color map (close to tk version feeling)
+# Status color map
 # ----------------------------
 STATUS_COLOR = {
     "护盾": "#f2c14e",
@@ -148,36 +155,48 @@ STATUS_COLOR = {
 }
 
 def token_html(token: str):
-    base = token
     key = token
     for k in STATUS_COLOR.keys():
         if token.startswith(k):
             key = k
             break
     color = STATUS_COLOR.get(key, "#bfc5cc")
-    return f'<span class="sttok" style="color:{color}; border-color:{color}55; background:{color}12;">{base}</span>'
+    return f'<span class="sttok" style="color:{color}; border-color:{color}77; background:{color}14;">{token}</span>'
 
 def parse_brief(brief: str):
     if not brief:
         return []
     return [p.strip() for p in brief.split("；") if p.strip()]
 
-def current_snapshot():
-    """Use last replay frame snap if present; else build from engine state."""
-    if st.session_state.snap is not None:
-        return st.session_state.snap
-    # build minimal snap
-    roles = {}
+def build_roles_map_from_engine():
+    roles_map = {}
     for cid in getattr(engine, "rank", []):
         r = engine.roles.get(cid)
         if not r:
             continue
-        roles[cid] = {"alive": bool(getattr(r, "alive", True)), "brief": r.status.brief() if hasattr(r, "status") else "", "name": getattr(r, "name", str(cid))}
-    return {"turn": getattr(engine, "turn", 0), "rank": list(getattr(engine, "rank", [])), "roles": roles}
+        roles_map[cid] = {
+            "alive": bool(getattr(r, "alive", True)),
+            "brief": r.status.brief() if hasattr(r, "status") else "",
+            "name": getattr(r, "name", str(cid)),
+        }
+    return roles_map
 
-def render_role_list(rank_slice, roles_map, selected_cid=None):
+def merge_snap_with_engine(snap):
+    """Ensure snap has proper role names and status strings even if snap is minimal."""
+    if not isinstance(snap, dict):
+        snap = {}
+    snap.setdefault("rank", list(getattr(engine, "rank", [])))
+    snap.setdefault("roles", {})
+    eng_map = build_roles_map_from_engine()
+    for cid, info in eng_map.items():
+        snap["roles"].setdefault(cid, {})
+        for k in ("alive", "brief", "name"):
+            snap["roles"][cid].setdefault(k, info.get(k))
+    return snap
+
+def render_role_list(numbered_slice, roles_map, selected_cid=None):
     rows = []
-    for i, cid in rank_slice:
+    for i, cid in numbered_slice:
         info = roles_map.get(cid, {})
         alive = info.get("alive", True)
         name = info.get("name", str(cid))
@@ -187,9 +206,7 @@ def render_role_list(rank_slice, roles_map, selected_cid=None):
             cls += " selected"
         if not alive:
             cls += " dead"
-        toks = parse_brief(brief)
-        # TK-like: show up to 2 tokens on the right (keep list tidy)
-        toks = toks[:2]
+        toks = parse_brief(brief)[:2]
         right = "".join(token_html(t) for t in toks)
         rows.append(
             f"""<div class="{cls}">
@@ -202,98 +219,105 @@ def render_role_list(rank_slice, roles_map, selected_cid=None):
         )
     return "\n".join(rows) if rows else "<div class='log-line log-empty'>（空）</div>"
 
-def render_log_lines(log_lines):
+def render_log_lines(lines):
     html = []
-    for s in log_lines:
+    for s in lines:
         if not s:
             html.append("<div class='log-line log-empty'> </div>")
         else:
             html.append(f"<div class='log-line'>{s}</div>")
     return "\n".join(html) if html else "<div class='log-line log-empty'>暂无日志</div>"
 
-def set_snap(snap):
-    st.session_state.snap = snap
-    # pick selected from highlights if available
-    # try: first highlight cid in snap roles that exists
-    # otherwise keep previous
-    return
-
-def play_turn_animation(log_box, left_box, mid_box):
+def get_current_snap():
+    # Prefer latest frame snap if playing
+    if st.session_state.playing and st.session_state.turn_frames:
+        fi = min(st.session_state.frame_i, len(st.session_state.turn_frames)-1)
+        fr = st.session_state.turn_frames[fi]
+        snap = fr.get("snap") if isinstance(fr, dict) else None
+        return merge_snap_with_engine(snap or {})
+    # Otherwise, last frame from engine if exists
     frames = getattr(engine, "replay_frames", None) or []
-    if not frames:
-        snap = current_snapshot()
-        set_snap(snap)
-        log_box.markdown(render_log_lines(getattr(engine, "log", [])[-400:]), unsafe_allow_html=True)
-        rerender_roles(left_box, mid_box, snap)
-        return
+    if frames:
+        last = frames[-1]
+        if isinstance(last, dict) and last.get("snap"):
+            return merge_snap_with_engine(last["snap"])
+    # Fallback: engine state
+    return merge_snap_with_engine({})
 
-    full_log = getattr(engine, "log", [])
-    start_index = max(0, len(full_log) - len(frames))
-
-    # During animation, use each frame's snap + highlights to emulate selection
-    for i, fr in enumerate(frames):
-        snap = fr.get("snap")
-        highlights = fr.get("highlights") or []
-        if snap:
-            set_snap(snap)
-        # choose selected
-        sel = st.session_state.selected_cid
+def get_selected_from_frame(fr, snap_roles):
+    highlights = fr.get("highlights") if isinstance(fr, dict) else None
+    if highlights:
         for h in highlights:
-            if isinstance(h, dict) and h.get("cid") in (snap or {}).get("roles", {}):
-                sel = h["cid"]
-                break
-        st.session_state.selected_cid = sel
+            if isinstance(h, dict) and h.get("cid") in snap_roles:
+                return h["cid"]
+    return st.session_state.selected_cid
 
-        subset = full_log[: start_index + i + 1]
-        log_box.markdown(render_log_lines(subset[-400:]), unsafe_allow_html=True)
-        rerender_roles(left_box, mid_box, snap or current_snapshot(), selected_cid=sel)
-        time.sleep(float(st.session_state.speed))
+def start_play_one_turn():
+    # Advance one turn and capture frames for this turn
+    before_len = len(getattr(engine, "log", []))
+    engine.next_turn()
+    frames = getattr(engine, "replay_frames", None) or []
+    st.session_state.turn_frames = frames
+    st.session_state.turn_start_log_len = before_len
+    st.session_state.frame_i = 0
+    st.session_state.playing = True
 
-def rerender_roles(left_box, mid_box, snap, selected_cid=None):
-    rank = snap.get("rank", [])
-    roles_map = snap.get("roles", {})
-    # only show alive roles as in tk list
-    alive_rank = []
-    for cid in rank:
-        info = roles_map.get(cid, {})
-        if info.get("alive", True):
-            alive_rank.append(cid)
-
-    # Assign numbering 1..N by alive order (tk version)
-    numbered = list(enumerate(alive_rank, start=1))
-    left_part = numbered[:13]
-    mid_part = numbered[13:26]
-
-    left_html = render_role_list(left_part, roles_map, selected_cid=selected_cid)
-    mid_html  = render_role_list(mid_part, roles_map, selected_cid=selected_cid)
-
-    left_box.markdown(left_html, unsafe_allow_html=True)
-    mid_box.markdown(mid_html, unsafe_allow_html=True)
+def step_frame_if_playing():
+    if not st.session_state.playing:
+        return
+    if st.session_state.frame_i >= max(0, len(st.session_state.turn_frames)-1):
+        # Done
+        st.session_state.playing = False
+        return
+    st.session_state.frame_i += 1
 
 # ----------------------------
-# Controls (top like tk bottom bar; streamlit can't truly pin bottom reliably)
+# Controls
 # ----------------------------
-c1, c2, c3, c4, c5 = st.columns([1.1, 1.1, 1.2, 1.7, 2.0], gap="small")
+st.caption(f"UI VERSION: {UI_VERSION}")
 
+c1, c2, c3, c4, c5 = st.columns([1.1, 1.1, 1.3, 1.7, 2.0], gap="small")
 with c1:
-    new_clicked = st.button("新开局", use_container_width=True)
+    new_clicked = st.button("新开局", use_container_width=True, disabled=st.session_state.playing)
 with c2:
-    next_clicked = st.button("下一回合", use_container_width=True)
+    next_clicked = st.button("下一回合", use_container_width=True, disabled=st.session_state.playing)
 with c3:
-    play_clicked = st.button("自动播放（单回合）", use_container_width=True)
+    play_clicked = st.button("自动播放（单回合）", use_container_width=True, disabled=st.session_state.playing)
 with c4:
     st.session_state.speed = st.slider("播放速度（秒/行）", 0.05, 0.80, float(st.session_state.speed), 0.05)
 with c5:
-    st.caption("目标：尽量复刻 a1.1.10 的三栏 UI（角色/角色/日志）。")
+    if st.session_state.playing:
+        st.info("正在播放中…（无阻塞）")
+    else:
+        st.caption("目标：尽量复刻 a1.1.10 的三栏 UI（角色/角色/日志）。")
 
 if new_clicked:
     engine.new_game()
-    st.session_state.snap = None
     st.session_state.selected_cid = None
+    st.session_state.playing = False
+    st.session_state.turn_frames = []
+    st.session_state.frame_i = 0
+    st.rerun()
+
+if next_clicked:
+    engine.next_turn()
+    st.rerun()
+
+if play_clicked:
+    start_play_one_turn()
     st.rerun()
 
 # ----------------------------
-# Main 3 panels: Roles(1..13) | Roles(14..26) | Log
+# If playing, auto-rerun at interval (animation)
+# ----------------------------
+if st.session_state.playing:
+    interval_ms = int(max(50, float(st.session_state.speed) * 1000))
+    st_autorefresh(interval=interval_ms, key="anim_tick")
+    # advance one frame per tick
+    step_frame_if_playing()
+
+# ----------------------------
+# Main 3 panels
 # ----------------------------
 colA, colB, colC = st.columns([1.0, 1.0, 1.15], gap="small")
 
@@ -312,25 +336,32 @@ with colC:
     log_box = st.container()
     st.markdown('</div></div>', unsafe_allow_html=True)
 
-# Initial render from snapshot
-snap = current_snapshot()
-rerender_roles(left_box, mid_box, snap, selected_cid=st.session_state.selected_cid)
-log_box.markdown(render_log_lines(getattr(engine, "log", [])[-400:]), unsafe_allow_html=True)
+snap = get_current_snap()
+rank = snap.get("rank", [])
+roles_map = snap.get("roles", {})
 
-# Actions
-if next_clicked:
-    engine.next_turn()
-    # update to latest snap if available
-    if getattr(engine, "replay_frames", None):
-        last = engine.replay_frames[-1]
-        if isinstance(last, dict) and last.get("snap"):
-            st.session_state.snap = last["snap"]
-    st.rerun()
+# alive ordering like tk
+alive_rank = [cid for cid in rank if roles_map.get(cid, {}).get("alive", True)]
+numbered = list(enumerate(alive_rank, start=1))
+left_part = numbered[:13]
+mid_part = numbered[13:26]
 
-if play_clicked:
-    engine.next_turn()
-    play_turn_animation(log_box, left_box, mid_box)
-    # final render
-    snap = current_snapshot()
-    rerender_roles(left_box, mid_box, snap, selected_cid=st.session_state.selected_cid)
-    log_box.markdown(render_log_lines(getattr(engine, "log", [])[-400:]), unsafe_allow_html=True)
+# selection follow highlights during playing
+if st.session_state.playing and st.session_state.turn_frames:
+    fi = min(st.session_state.frame_i, len(st.session_state.turn_frames)-1)
+    fr = st.session_state.turn_frames[fi]
+    st.session_state.selected_cid = get_selected_from_frame(fr, roles_map)
+
+left_box.markdown(render_role_list(left_part, roles_map, selected_cid=st.session_state.selected_cid), unsafe_allow_html=True)
+mid_box.markdown(render_role_list(mid_part, roles_map, selected_cid=st.session_state.selected_cid), unsafe_allow_html=True)
+
+# log subset during animation: show only turn's progressive lines
+full_log = getattr(engine, "log", [])
+if st.session_state.playing and st.session_state.turn_frames:
+    # show progressive length based on frame_i
+    shown = st.session_state.turn_start_log_len + st.session_state.frame_i + 1
+    log_lines = full_log[:shown][-400:]
+else:
+    log_lines = full_log[-400:]
+
+log_box.markdown(render_log_lines(log_lines), unsafe_allow_html=True)

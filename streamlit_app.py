@@ -1,21 +1,14 @@
 # -*- coding: utf-8 -*-
-import importlib
 import re
-import html
+import importlib
 import streamlit as st
-import streamlit.components.v1 as components
 from streamlit_autorefresh import st_autorefresh
 
 # IMPORTANT: set_page_config must be the first Streamlit command.
 st.set_page_config(page_title="神秘游戏", layout="wide")
 
-UI_VERSION = "v5-2025-12-27"
+UI_VERSION = "v6-2025-12-27"
 
-# ----------------------------
-# CSS: match a1.1.10 (3 columns: role / role / log)
-# - No global page scroll; each panel scrolls
-# - Role rows separated, selected = yellow
-# ----------------------------
 st.markdown("""
 <style>
   :root{
@@ -25,31 +18,26 @@ st.markdown("""
     --text: #111;
     --muted: #666;
     --select: #fff3b0;
+    --kill: #d0021b;
   }
   html, body, [data-testid="stAppViewContainer"] { height: 100%; overflow: hidden; background: var(--bg); }
   [data-testid="stAppViewContainer"] > .main { height: 100%; overflow: hidden; background: var(--bg); }
   .block-container { padding-top: 0.35rem; padding-bottom: 0.35rem; max-width: 100%; }
   header { visibility: hidden; height: 0px; }
-  [data-testid="stToolbar"] { visibility: visible; }
 
-  /* Buttons */
-  .stButton>button { height: 42px; border-radius: 6px; }
-
-  /* Panel html */
-  .nb-panel{
+  .nb-panel {
     background: var(--panel);
     border: 1px solid var(--line);
     border-radius: 0px;
-    height: calc(100vh - 150px);
+    height: calc(100vh - 170px);
     overflow: hidden;
   }
-  .nb-title{
+  .nb-panel-title{
     font-weight: 700;
     padding: 8px 10px;
     border-bottom: 1px solid var(--line);
     color: var(--text);
     background: #f3f3f3;
-    font-size: 18px;
   }
   .nb-scroll{
     height: calc(100% - 41px);
@@ -66,7 +54,12 @@ st.markdown("""
     color: var(--text);
     background: transparent;
   }
-  .role-left{ display:flex; gap: 8px; align-items:center; min-width: 0; }
+  .role-left{
+    display:flex;
+    gap: 8px;
+    align-items:center;
+    min-width: 0;
+  }
   .role-idx{ width: 30px; color: var(--text); font-weight: 700; }
   .role-name{ white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .role-right{ display:flex; gap: 10px; align-items:center; }
@@ -75,32 +68,33 @@ st.markdown("""
     padding: 2px 8px;
     border-radius: 999px;
     font-size: 14px;
+    font-weight: 700;
     border: 1px solid rgba(0,0,0,0.10);
     background: rgba(0,0,0,0.03);
     color: var(--text);
-    white-space: nowrap;
+    line-height: 1.2;
   }
   .selected{ background: var(--select); }
   .dead{ opacity: 0.45; text-decoration: line-through; }
 
-  /* Log */
   .log-line{
     padding: 3px 10px;
     font-size: 16px;
     line-height: 1.25;
     color: var(--text);
     white-space: pre-wrap;
-    word-break: break-word;
   }
   .log-empty{ color: var(--muted); }
-  .log-hr{ padding: 6px 10px; font-weight: 700; color:#333; }
   .log-name{ font-weight: 800; }
+  .log-kill{ color: var(--kill); font-weight: 900; }
+  .log-bullet{ color: var(--muted); font-weight: 700; }
+  .log-section{ font-weight: 900; }
+
+  .stButton>button { height: 42px; border-radius: 6px; }
+  #log-end { height: 1px; }
 </style>
 """, unsafe_allow_html=True)
 
-# ----------------------------
-# Engine
-# ----------------------------
 @st.cache_resource
 def load_engine():
     core = importlib.import_module("engine_core")
@@ -111,46 +105,52 @@ def load_engine():
 
 engine = load_engine()
 
-# ----------------------------
 # Session state
-# ----------------------------
-def ss_init():
-    st.session_state.setdefault("speed", 0.25)
-    st.session_state.setdefault("selected_cid", None)
+if "speed" not in st.session_state:
+    st.session_state.speed = 0.25
+if "selected_cid" not in st.session_state:
+    st.session_state.selected_cid = None
+if "playing" not in st.session_state:
+    st.session_state.playing = False
+if "frame_i" not in st.session_state:
+    st.session_state.frame_i = 0
+if "turn_start_log_len" not in st.session_state:
+    st.session_state.turn_start_log_len = 0
+if "turn_frames" not in st.session_state:
+    st.session_state.turn_frames = []
 
-    # playback
-    st.session_state.setdefault("playing", False)
-    st.session_state.setdefault("frame_i", 0)
-    st.session_state.setdefault("turn_frames", [])
-    st.session_state.setdefault("turn_start_log_len", 0)
-    st.session_state.setdefault("turn_log_lines", [])  # progressive
-    st.session_state.setdefault("log_autoscroll_nonce", 0)
-
-ss_init()
-
-# ----------------------------
-# Status color map (used by role tokens + log highlighting)
-# ----------------------------
+# Status colors aligned to a1.1.10 feel
 STATUS_COLOR = {
-    "护盾": "#f2c14e",
+    "护盾": "#f5a623",
     "净化": "#2ecc71",
-    "雷霆": "#2c7be5",
-    "感电": "#2c7be5",
+    "雷霆": "#4a90e2",
+    "封印": "#4a90e2",
+    "遗忘": "#4a90e2",
+    "感电": "#4a90e2",
     "氧化": "#2ecc71",
     "还原": "#2ecc71",
-    "集火": "#e74c3c",
-    "封印": "#2c7be5",
-    "遗忘": "#2c7be5",
-    "隐身": "#7f8c8d",
-    "辩护": "#f2c14e",
-    "圣辉": "#f2c14e",
-    "神威": "#f2c14e",
-    "防线": "#f2c14e",
     "附生": "#2ecc71",
-    "越挫越勇": "#f2c14e",
-    "厄运": "#e74c3c",
-    "炸弹": "#e74c3c",
-    "濒亡": "#e74c3c",
+    "鱼": "#2ecc71",
+    "乘胜追击": "#2ecc71",
+    "集火": "#d0021b",
+    "濒亡": "#d0021b",
+    "炸弹": "#d0021b",
+    "厄运": "#d0021b",
+    "腐化": "#d0021b",
+    "绝息": "#111111",
+    "隐身": "#9b9b9b",
+    "静默": "#9b9b9b",
+    "迂回": "#9b9b9b",
+    "目击": "#9b9b9b",
+    "黄昏": "#9b9b9b",
+    "留痕": "#9b9b9b",
+    "辩护": "#f8d24a",
+    "圣辉": "#f8d24a",
+    "神威": "#f8d24a",
+    "防线": "#f8d24a",
+    "越挫越勇": "#f8d24a",
+    "特异性免疫": "#f8d24a",
+    "洪伟之赐": "#f8d24a",
 }
 
 def token_html(token: str):
@@ -160,13 +160,12 @@ def token_html(token: str):
             key = k
             break
     color = STATUS_COLOR.get(key, "#bfc5cc")
-    tok = html.escape(token)
-    return f'<span class="sttok" style="color:{color}; border-color:{color}77; background:{color}14;">{tok}</span>'
+    return f'<span class="sttok" style="color:{color}; border-color:{color}77; background:{color}18;">{token}</span>'
 
 def parse_brief(brief: str):
     if not brief:
         return []
-    return [p.strip() for p in str(brief).split("；") if p.strip()]
+    return [p.strip() for p in brief.split("；") if p.strip()]
 
 def build_roles_map_from_engine():
     roles_map = {}
@@ -193,54 +192,154 @@ def merge_snap_with_engine(snap):
             snap["roles"][cid].setdefault(k, info.get(k))
     return snap
 
-# ----------------------------
-# Log formatting (bold names + color statuses)
-# ----------------------------
-_name_pat = re.compile(r"【([^】]+)】")
-_status_pat = re.compile(r"（([^）]+)）|\[([^\]]+)\]")
+# Log formatting
+NAME_IN_BRACKETS = re.compile(r"【([^】]+)】")
+NAME_WITH_NUM = re.compile(r"^(.*?)(\(\d+\))$")
 
-def format_log_line(s: str) -> str:
-    if not s:
-        return '<div class="log-line log-empty"> </div>'
+def strip_name_num(s: str) -> str:
+    m = NAME_WITH_NUM.match(s.strip())
+    if m:
+        return m.group(1)
+    return s
 
-    s = str(s)
+def format_log_line(line: str) -> str:
+    if not line:
+        return "<div class='log-line log-empty'> </div>"
+    esc = (line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
-    # separators / round headers
-    if ("========" in s) or s.startswith("——"):
-        return f'<div class="log-hr">{html.escape(s)}</div>'
+    if "====" in esc or "【新开局】" in esc:
+        esc = NAME_IN_BRACKETS.sub(lambda m: f"<span class='log-section'>【{strip_name_num(m.group(1))}】</span>", esc)
+        return f"<div class='log-line log-section'>{esc}</div>"
 
-    esc = html.escape(s)
+    if esc.startswith("·") or esc.startswith("•"):
+        esc = f"<span class='log-bullet'>·</span>{esc[1:]}"
 
-    # bold 【Name】
-    esc = _name_pat.sub(lambda m: f'【<span class="log-name">{m.group(1)}</span>】', esc)
+    esc = NAME_IN_BRACKETS.sub(lambda m: f"<span class='log-name'>【{strip_name_num(m.group(1))}】</span>", esc)
 
-    # color [Status] or （Status）
-    def _colorize(m):
-        token = m.group(1) or m.group(2) or ""
-        raw = token
-        key = raw
-        for k in STATUS_COLOR.keys():
-            if raw.startswith(k):
-                key = k
-                break
-        color = STATUS_COLOR.get(key)
-        if not color:
-            return m.group(0)
-        return m.group(0).replace(raw, f'<span style="color:{color}; font-weight:700">{raw}</span>')
+    if any(k in esc for k in ["淘汰", "击杀", "斩杀"]):
+        esc = esc.replace("class='log-name'", "class='log-name log-kill'")
 
-    esc = _status_pat.sub(_colorize, esc)
-
-    return f'<div class="log-line">{esc}</div>'
+    return f"<div class='log-line'>{esc}</div>"
 
 def render_log_html(lines):
-    if not lines:
-        return '<div class="log-line log-empty">暂无日志</div>'
-    return "\n".join(format_log_line(x) for x in lines)
+    html = [format_log_line(s) for s in lines]
+    html.append("<div id='log-end'></div>")
+    html.append("""
+<script>
+  const el = window.parent.document.querySelector('#log-end');
+  if (el) { el.scrollIntoView({behavior: 'instant', block: 'end'}); }
+</script>
+""")
+    return "\n".join(html) if html else "<div class='log-line log-empty'>暂无日志</div>"
 
-def render_roles_html(numbered_slice, roles_map, selected_cid=None):
-    if not numbered_slice:
-        return "<div class='log-line log-empty'>（空）</div>"
+def get_current_snap():
+    if st.session_state.playing and st.session_state.turn_frames:
+        fi = min(st.session_state.frame_i, len(st.session_state.turn_frames)-1)
+        fr = st.session_state.turn_frames[fi]
+        snap = fr.get("snap") if isinstance(fr, dict) else None
+        return merge_snap_with_engine(snap or {})
+    frames = getattr(engine, "replay_frames", None) or []
+    if frames:
+        last = frames[-1]
+        if isinstance(last, dict) and last.get("snap"):
+            return merge_snap_with_engine(last["snap"])
+    return merge_snap_with_engine({})
 
+def get_selected_from_frame(fr, snap_roles):
+    highlights = fr.get("highlights") if isinstance(fr, dict) else None
+    if highlights:
+        for h in highlights:
+            if isinstance(h, dict) and h.get("cid") in snap_roles:
+                return h["cid"]
+    return st.session_state.selected_cid
+
+def start_play_one_turn():
+    before_len = len(getattr(engine, "log", []))
+    engine.next_turn()
+    frames = getattr(engine, "replay_frames", None) or []
+    st.session_state.turn_frames = frames
+    st.session_state.turn_start_log_len = before_len
+    st.session_state.frame_i = 0
+    st.session_state.playing = True
+
+def step_frame_if_playing():
+    if not st.session_state.playing:
+        return
+    if st.session_state.frame_i >= max(0, len(st.session_state.turn_frames)-1):
+        st.session_state.playing = False
+        return
+    st.session_state.frame_i += 1
+
+# Controls
+st.caption(f"UI VERSION: {UI_VERSION}")
+
+c1, c2, c3, c4, c5 = st.columns([1.1, 1.1, 1.3, 1.7, 2.0], gap="small")
+with c1:
+    new_clicked = st.button("新开局", use_container_width=True, disabled=st.session_state.playing)
+with c2:
+    next_clicked = st.button("下一回合", use_container_width=True, disabled=st.session_state.playing)
+with c3:
+    play_clicked = st.button("自动播放（单回合）", use_container_width=True, disabled=st.session_state.playing)
+with c4:
+    st.session_state.speed = st.slider("播放速度（秒/行）", 0.05, 0.80, float(st.session_state.speed), 0.05)
+with c5:
+    if st.session_state.playing:
+        st.info("正在播放中…（逐行+自动滚动）")
+    else:
+        st.caption("目标：严格复刻 a1.1.10 的三栏 UI（角色/角色/日志）。")
+
+if new_clicked:
+    engine.new_game()
+    st.session_state.selected_cid = None
+    st.session_state.playing = False
+    st.session_state.turn_frames = []
+    st.session_state.frame_i = 0
+    st.rerun()
+
+if next_clicked:
+    engine.next_turn()
+    st.rerun()
+
+if play_clicked:
+    start_play_one_turn()
+    st.rerun()
+
+if st.session_state.playing:
+    interval_ms = int(max(80, float(st.session_state.speed) * 1000))
+    st_autorefresh(interval=interval_ms, key="anim_tick")
+    step_frame_if_playing()
+
+# Main 3 panels
+colA, colB, colC = st.columns([1.0, 1.0, 1.15], gap="small")
+
+with colA:
+    st.markdown('<div class="nb-panel"><div class="nb-panel-title">角色</div><div class="nb-scroll">', unsafe_allow_html=True)
+    left_box = st.container()
+    st.markdown('</div></div>', unsafe_allow_html=True)
+with colB:
+    st.markdown('<div class="nb-panel"><div class="nb-panel-title">角色</div><div class="nb-scroll">', unsafe_allow_html=True)
+    mid_box = st.container()
+    st.markdown('</div></div>', unsafe_allow_html=True)
+with colC:
+    st.markdown('<div class="nb-panel"><div class="nb-panel-title">日志</div><div class="nb-scroll">', unsafe_allow_html=True)
+    log_box = st.container()
+    st.markdown('</div></div>', unsafe_allow_html=True)
+
+snap = get_current_snap()
+rank = snap.get("rank", [])
+roles_map = snap.get("roles", {})
+
+alive_rank = [cid for cid in rank if roles_map.get(cid, {}).get("alive", True)]
+numbered = list(enumerate(alive_rank, start=1))
+left_part = numbered[:13]
+mid_part = numbered[13:26]
+
+if st.session_state.playing and st.session_state.turn_frames:
+    fi = min(st.session_state.frame_i, len(st.session_state.turn_frames)-1)
+    fr = st.session_state.turn_frames[fi]
+    st.session_state.selected_cid = get_selected_from_frame(fr, roles_map)
+
+def render_role_list(numbered_slice, roles_map, selected_cid=None):
     rows = []
     for i, cid in numbered_slice:
         info = roles_map.get(cid, {})
@@ -256,183 +355,25 @@ def render_roles_html(numbered_slice, roles_map, selected_cid=None):
         right = "".join(token_html(t) for t in toks)
         rows.append(
             f"""<div class="{cls}">
-                  <div class="role-left">
+                <div class="role-left">
                     <div class="role-idx">{i}.</div>
-                    <div class="role-name">{html.escape(str(name))}</div>
-                  </div>
-                  <div class="role-right">{right}</div>
-                </div>"""
+                    <div class="role-name">{name}</div>
+                </div>
+                <div class="role-right">{right}</div>
+            </div>"""
         )
+    while len(rows) < 13:
+        rows.append("<div class='role-row'><div class='role-left'><div class='role-idx'>&nbsp;</div><div class='role-name'>&nbsp;</div></div><div class='role-right'></div></div>")
     return "\n".join(rows)
 
-def panel_html(title: str, body_html: str, scroll_to_bottom: bool = False, nonce: int = 0) -> str:
-    # If scroll_to_bottom, JS will push scroll to end on every nonce change.
-    js = ""
-    if scroll_to_bottom:
-        js = f"""
-<script>
-(function(){{
-  const panel = document.getElementById("nb-scroll-{nonce}");
-  if(panel){{ panel.scrollTop = panel.scrollHeight; }}
-}})();
-</script>
-"""
-    return f"""
-<div class="nb-panel">
-  <div class="nb-title">{html.escape(title)}</div>
-  <div class="nb-scroll" id="nb-scroll-{nonce}">
-    {body_html}
-  </div>
-</div>
-{js}
-"""
+left_box.markdown(render_role_list(left_part, roles_map, selected_cid=st.session_state.selected_cid), unsafe_allow_html=True)
+mid_box.markdown(render_role_list(mid_part, roles_map, selected_cid=st.session_state.selected_cid), unsafe_allow_html=True)
 
-# ----------------------------
-# Playback: use engine.replay_frames[text] for smooth line-by-line
-# ----------------------------
-def start_play_one_turn():
-    before_len = len(getattr(engine, "log", []))
-    engine.next_turn()
-    frames = getattr(engine, "replay_frames", None) or []
-    st.session_state.turn_frames = frames
-    st.session_state.turn_start_log_len = before_len
-    st.session_state.frame_i = 0
-    st.session_state.playing = True
-    st.session_state.turn_log_lines = getattr(engine, "log", [])[:before_len]  # start from old log
-
-def step_frame_if_playing():
-    if not st.session_state.playing:
-        return
-
-    frames = st.session_state.turn_frames
-    if not frames:
-        st.session_state.playing = False
-        return
-
-    i = st.session_state.frame_i
-    if i >= len(frames):
-        st.session_state.playing = False
-        return
-
-    fr = frames[i]
-    # Append this frame's text to progressive lines
-    txt = fr.get("text") if isinstance(fr, dict) else None
-    if txt is not None:
-        st.session_state.turn_log_lines.append(txt)
-
-    # Follow highlight selection
-    snap = fr.get("snap") if isinstance(fr, dict) else None
-    snap = merge_snap_with_engine(snap or {})
-    highlights = fr.get("highlights") if isinstance(fr, dict) else None
-    if highlights:
-        for h in highlights:
-            if isinstance(h, dict) and h.get("cid") in snap.get("roles", {}):
-                st.session_state.selected_cid = h["cid"]
-                break
-
-    # advance
-    st.session_state.frame_i += 1
-
-    # autoscroll trigger
-    st.session_state.log_autoscroll_nonce += 1
-
-    # stop after last frame appended
-    if st.session_state.frame_i >= len(frames):
-        st.session_state.playing = False
-
-def get_current_snap():
-    # If playing, use last snap from frame_i-1
-    if st.session_state.playing and st.session_state.turn_frames:
-        fi = max(0, min(st.session_state.frame_i - 1, len(st.session_state.turn_frames) - 1))
-        fr = st.session_state.turn_frames[fi]
-        snap = fr.get("snap") if isinstance(fr, dict) else None
-        return merge_snap_with_engine(snap or {})
-    # Otherwise last frame snap
-    frames = getattr(engine, "replay_frames", None) or []
-    if frames:
-        last = frames[-1]
-        if isinstance(last, dict) and last.get("snap"):
-            return merge_snap_with_engine(last["snap"])
-    return merge_snap_with_engine({})
-
-# ----------------------------
-# Controls
-# ----------------------------
-st.caption(f"UI VERSION: {UI_VERSION}")
-
-c1, c2, c3, c4, c5 = st.columns([1.1, 1.1, 1.35, 1.7, 2.0], gap="small")
-with c1:
-    new_clicked = st.button("新开局", use_container_width=True, disabled=st.session_state.playing)
-with c2:
-    next_clicked = st.button("下一回合", use_container_width=True, disabled=st.session_state.playing)
-with c3:
-    play_clicked = st.button("自动播放（单回合）", use_container_width=True, disabled=st.session_state.playing)
-with c4:
-    st.session_state.speed = st.slider("播放速度（秒/行）", 0.05, 0.80, float(st.session_state.speed), 0.05)
-with c5:
-    if st.session_state.playing:
-        st.info("正在播放中…")
-    else:
-        st.caption("目标：尽量复刻 a1.1.10 的三栏 UI（角色/角色/日志）。")
-
-if new_clicked:
-    engine.new_game()
-    st.session_state.selected_cid = None
-    st.session_state.playing = False
-    st.session_state.turn_frames = []
-    st.session_state.frame_i = 0
-    st.session_state.turn_log_lines = []
-    st.session_state.log_autoscroll_nonce += 1
-    st.rerun()
-
-if next_clicked:
-    engine.next_turn()
-    st.session_state.log_autoscroll_nonce += 1
-    st.rerun()
-
-if play_clicked:
-    start_play_one_turn()
-    st.rerun()
-
-# ----------------------------
-# If playing, auto-rerun at interval (animation)
-# ----------------------------
-if st.session_state.playing:
-    interval_ms = int(max(50, float(st.session_state.speed) * 1000))
-    st_autorefresh(interval=interval_ms, key="anim_tick")
-    step_frame_if_playing()
-
-# ----------------------------
-# Main 3 panels (render with components.html to avoid Streamlit DOM nesting bugs)
-# ----------------------------
-snap = get_current_snap()
-rank = snap.get("rank", [])
-roles_map = snap.get("roles", {})
-
-# alive ordering like tk
-alive_rank = [cid for cid in rank if roles_map.get(cid, {}).get("alive", True)]
-numbered = list(enumerate(alive_rank, start=1))
-left_part = numbered[:13]
-mid_part = numbered[13:26]
-
-role_left_html = render_roles_html(left_part, roles_map, selected_cid=st.session_state.selected_cid)
-role_mid_html = render_roles_html(mid_part, roles_map, selected_cid=st.session_state.selected_cid)
-
-# log: if playing use progressive lines, else full engine log
-if st.session_state.playing:
-    log_lines = st.session_state.turn_log_lines[-400:]
-    nonce = st.session_state.log_autoscroll_nonce
+full_log = getattr(engine, "log", [])
+if st.session_state.playing and st.session_state.turn_frames:
+    shown = st.session_state.turn_start_log_len + st.session_state.frame_i + 1
+    log_lines = full_log[:shown][-400:]
 else:
-    log_lines = (getattr(engine, "log", []) or [])[-400:]
-    nonce = st.session_state.log_autoscroll_nonce
+    log_lines = full_log[-400:]
 
-log_html = render_log_html(log_lines)
-
-colA, colB, colC = st.columns([1.0, 1.0, 1.15], gap="small")
-with colA:
-    components.html(panel_html("角色", role_left_html, scroll_to_bottom=False, nonce=0), height=650, scrolling=False)
-with colB:
-    components.html(panel_html("角色", role_mid_html, scroll_to_bottom=False, nonce=1), height=650, scrolling=False)
-with colC:
-    # autoscroll for log
-    components.html(panel_html("日志", log_html, scroll_to_bottom=True, nonce=nonce), height=650, scrolling=False)
+log_box.markdown(render_log_html(log_lines), unsafe_allow_html=True)

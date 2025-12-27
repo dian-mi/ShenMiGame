@@ -3843,3 +3843,11 @@ def _engine_set_invincible(self, cid: int, enable: bool = True):
         s.discard(cid)
 
 Engine.set_invincible = _engine_set_invincible
+
+# --- Streamlit compatibility ---
+GameEngine = Engine
+
+__all__ = ["Engine", "GameEngine"]
+
+# Engine version for debugging
+ENGINE_VERSION = "1.0.0"

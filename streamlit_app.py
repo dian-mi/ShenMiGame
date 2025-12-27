@@ -41,9 +41,17 @@ def load_engine():
             raise
         core = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(core)  # type: ignore[attr-defined]
-    return core.GameEngine()
+    return getattr(core, 'GameEngine', getattr(core, 'Engine'))()
 
 engine = load_engine()
+with st.sidebar.expander("Debug", expanded=False):
+    try:
+        import engine_core as _core
+        st.write("ENGINE_VERSION:", getattr(_core, "ENGINE_VERSION", "unknown"))
+        st.write("Engine class:", type(engine).__name__)
+    except Exception as e:
+        st.error(f"Debug info failed: {e}")
+
 
 def _ss_init():
     ss = st.session_state

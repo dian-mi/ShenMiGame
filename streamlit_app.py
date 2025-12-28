@@ -35,6 +35,9 @@ engine = load_engine()
 # ----------------------------
 if "speed" not in st.session_state:
     st.session_state.speed = 0.25
+
+if "did_tick" not in st.session_state:
+    st.session_state.did_tick = False
 if "playing" not in st.session_state:
     st.session_state.playing = False
 if "frame_i" not in st.session_state:
@@ -357,20 +360,29 @@ if pause_clicked:
 # Auto-play tick (one line per tick)
 if st.session_state.playing:
     st_autorefresh(interval=_recommended_interval_ms(), key="anim_tick")
+    st.session_state.did_tick = True
 
 def _advance_if_playing():
+    # Advance exactly one line per autorefresh tick.
     if not st.session_state.playing:
+        st.session_state.did_tick = False
+        return
+    if not st.session_state.did_tick:
         return
     frames = st.session_state.turn_frames or []
     if not frames:
         st.session_state.playing = False
+        st.session_state.did_tick = False
         return
     if st.session_state.frame_i >= max(0, len(frames) - 1):
         st.session_state.playing = False
+        st.session_state.did_tick = False
         return
     st.session_state.frame_i += 1
+    st.session_state.did_tick = False
 
 _advance_if_playing()
+
 
 if st.session_state.playing:
     st.info("自动播放中…（暂停可停止）")

@@ -216,8 +216,11 @@ def get_current_snap():
 
 def get_selected_from_frame(fr, roles_map):
     hs = fr.get("highlights") if isinstance(fr, dict) else None
-    if hs:
+    if isinstance(hs, list) and hs:
         for h in hs:
+            # engine_core uses List[int]; some variants may use dicts
+            if isinstance(h, int) and h in roles_map:
+                return h
             if isinstance(h, dict) and h.get("cid") in roles_map:
                 return h["cid"]
     return st.session_state.selected_cid
@@ -225,11 +228,12 @@ def get_selected_from_frame(fr, roles_map):
 
 def get_focus_from_frame(fr, roles_map):
     """Return primary triggering role cid for current frame.
-    Prefer actor/trigger in highlights; fallback to first valid cid."""
+    engine_core: highlights is List[int] parsed from current log line."""
     hs = fr.get("highlights") if isinstance(fr, dict) else None
-    if isinstance(hs, list):
-        # Prefer actor/trigger roles
+    if isinstance(hs, list) and hs:
         for h in hs:
+            if isinstance(h, int) and h in roles_map:
+                return h
             if isinstance(h, dict) and h.get("cid") in roles_map:
                 return h.get("cid")
     return None

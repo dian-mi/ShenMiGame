@@ -47,40 +47,66 @@ if "selected_cid" not in st.session_state:
     st.session_state.selected_cid = None
 
 # ----------------------------
-# Status colors (aligned to your a1.1.10 screenshot palette)
+# Status colors (match a1.1.10 Tkinter exactly)
 # ----------------------------
-STATUS_COLOR = {
-    "护盾": "#f5a623",
-    "净化": "#2ecc71",
-    "雷霆": "#4a90e2",
-    "封印": "#4a90e2",
-    "遗忘": "#4a90e2",
-    "感电": "#4a90e2",
-    "氧化": "#2ecc71",
-    "还原": "#2ecc71",
-    "附生": "#2ecc71",
-    "鱼": "#2ecc71",
-    "乘胜追击": "#2ecc71",
-    "集火": "#d0021b",
-    "濒亡": "#d0021b",
-    "炸弹": "#d0021b",
-    "厄运": "#d0021b",
-    "腐化": "#d0021b",
-    "绝息": "#111111",
-    "隐身": "#9b9b9b",
-    "静默": "#9b9b9b",
-    "迂回": "#9b9b9b",
-    "目击": "#9b9b9b",
-    "黄昏": "#9b9b9b",
-    "留痕": "#9b9b9b",
-    "辩护": "#f8d24a",
-    "圣辉": "#f8d24a",
-    "神威": "#f8d24a",
-    "防线": "#f8d24a",
-    "越挫越勇": "#f8d24a",
-    "特异性免疫": "#f8d24a",
-    "洪伟之赐": "#f8d24a",
-}
+# a1.1.10 palette:
+#   color_thunder = "#0B3D91", color_pos = "#D4AF37", color_neg = "#E53935", color_purple = "#8E44AD"
+def status_color(part: str) -> str:
+    part = (part or "").strip()
+    if not part:
+        return "#000000"
+    # Keep order consistent with a1.1.10 _set_rank_row
+    if part.startswith("雷霆"):
+        return "#0B3D91"
+    elif part.startswith("腐化"):
+        return "#8E44AD"
+    elif part.startswith("隐身"):
+        return "#A0A0A0"
+    elif part.startswith("鱼"):
+        return "#2E86C1"
+    elif part.startswith("濒亡"):
+        return "#E53935"
+    elif part.startswith("炸弹"):
+        return "#E53935"
+    elif part.startswith("越挫越勇"):
+        return "#8B4513"
+    elif part.startswith("神威"):
+        return "#D4AF37"
+    elif part.startswith("洪伟之赐"):
+        return "#D4AF37"
+    elif part.startswith("雷霆手腕"):
+        return "#0B3D91"
+    elif part.startswith("氧化") or part.startswith("还原"):
+        return "#006400"
+    elif part.startswith("附生"):
+        return "#F7DC6F"
+    elif part.startswith("孤军奋战"):
+        return "#D4AF37"
+    elif part.startswith("特异性免疫"):
+        return "#2ECC71"
+    elif part.startswith("净化"):
+        return "#7DCEA0"  # 浅绿色
+    elif part.startswith("圣辉"):
+        return "#D4AF37"  # 金色
+    elif part.startswith("感电"):
+        return "#85C1E9"  # 浅蓝色
+    elif part.startswith("乘胜追击"):
+        return "#F5B041"  # 浅橙色
+    elif part.startswith("目击"):
+        return "#8B4513"  # 棕色
+    elif part.startswith("辩护"):
+        return "#D4AF37"  # 金色
+    elif part.startswith("静默"):
+        return "#7D3C98"  # 灰紫
+    elif part.startswith("迂回"):
+        return "#76D7C4"  # 浅青
+    elif part.startswith("防线"):
+        return "#1E8449"  # 深绿
+    elif part.startswith("护盾"):
+        return "#D4AF37"
+    else:
+        # a1.1.10 default: negative red
+        return "#E53935"
 
 NAME_IN_BRACKETS = re.compile(r"【([^】]+)】")
 NAME_WITH_NUM = re.compile(r"^(.*?)(\(\d+\))$")
@@ -90,12 +116,7 @@ def strip_name_num(s: str) -> str:
     return m.group(1) if m else s
 
 def token_html(token: str) -> str:
-    key = token
-    for k in STATUS_COLOR.keys():
-        if token.startswith(k):
-            key = k
-            break
-    color = STATUS_COLOR.get(key, "#bfc5cc")
+    color = status_color(token)
     return f'<span class="sttok" style="color:{color}; border-color:{color}77; background:{color}18;">{token}</span>'
 
 def parse_brief(brief: str):

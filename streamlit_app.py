@@ -248,8 +248,44 @@ def get_focus_from_frame(fr, roles_map):
 
 def format_log_line(s):
     # Remove trailing (cid) after names, but keep other parentheses like (2回合)
-    # Pattern: Name(number) -> Name
     s = re.sub(r'([\u4e00-\u9fffA-Za-z_]+)\(\d+\)', r'\1', s)
+
+    # Bold all role names wherever they appear in the log line
+    # (Names list is computed per rerun from current roles_map)
+    line = s
+    try:
+        for nm in LOG_ROLE_NAMES:
+            if not nm:
+                continue
+            # Avoid accidental replacements inside existing HTML tags (we build HTML later)
+            line = re.sub(re.escape(nm), f"<b class='log-name'>{nm}</b>", line)
+    except Exception:
+        pass
+
+    # Section / header styling
+    if line.startswith("【") and "】" in line:
+        head, rest = line.split("】", 1)
+        line = f"<b>{head}】</b>{rest}"
+    if "====" in line:
+        line = f"<b>{line}</b>"
+
+    # Bullet styling
+    if line.strip().startswith(("·", "•")):
+        line = f"<span class='log-bullet'>{line}</span>"
+
+    # Kill / elimination highlighting: ONLY color eliminated role(s) red
+    def _mark_victim(m):
+        kw = m.group(1)
+        name = m.group(2)
+        return f"{kw} <span class='log-kill'>{name}</span>"
+
+    line = re.sub(r'(淘汰|击杀|斩杀)\s*[:：]\s*([\u4e00-\u9fffA-Za-z_]+)', _mark_victim, line)
+    line = re.sub(r'(淘汰|击杀|斩杀)\s+([\u4e00-\u9fffA-Za-z_]+)', _mark_victim, line)
+    line = re.sub(r'(目标(?:被)?(?:淘汰|击杀|斩杀))\s*[:：]?\s*([\u4e00-\u9fffA-Za-z_]+)',
+                  lambda m: f"{m.group(1)} <span class='log-kill'>{m.group(2)}</span>", line)
+
+    return f"<div class='log-line'>{line}</div>"
+
 
     line = s
 
@@ -462,6 +498,10 @@ snap = get_current_snap()
 rank = snap.get("rank", [])
 roles_map = snap.get("roles", {})
 
+# Build role name list for log bolding
+LOG_ROLE_NAMES = sorted({info.get('name','') for info in roles_map.values() if info.get('name')}, key=len, reverse=True)
+
+
 if st.session_state.playback_active and st.session_state.turn_frames:
     fi = min(st.session_state.frame_i, len(st.session_state.turn_frames)-1)
     fr = st.session_state.turn_frames[fi]
@@ -507,7 +547,7 @@ left_rows = render_role_rows(left_part)
 mid_rows  = render_role_rows(mid_part)
 
 full_log = getattr(engine, "log", [])
-if st.session_state.playing and st.session_state.turn_frames:
+if st.session_state.playback_active and st.session_state.turn_frames:
     shown = st.session_state.turn_start_log_len + st.session_state.frame_i + 1
     log_lines = full_log[:shown][-400:]
 else:

@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import re
+import time
 import importlib
 import streamlit as st
 import streamlit.components.v1 as components
@@ -39,6 +40,14 @@ if "speed" not in st.session_state:
 if "did_tick" not in st.session_state:
     st.session_state.did_tick = False
 
+
+if "auto_skip" not in st.session_state:
+    st.session_state.auto_skip = False
+if "waiting_next_turn" not in st.session_state:
+    st.session_state.waiting_next_turn = False
+if "next_turn_at" not in st.session_state:
+    st.session_state.next_turn_at = 0.0
+
 if "focus_cids" not in st.session_state:
     st.session_state.focus_cids = []
 if "playing" not in st.session_state:
@@ -52,6 +61,8 @@ if "turn_frames" not in st.session_state:
 if "turn_start_log_len" not in st.session_state:
     st.session_state.turn_start_log_len = 0
     st.session_state.playback_active = False
+    st.session_state.waiting_next_turn = False
+    st.session_state.next_turn_at = 0.0
 if "selected_cid" not in st.session_state:
     st.session_state.selected_cid = None
 
@@ -249,6 +260,42 @@ def get_focus_from_frame(fr, roles_map):
 def format_log_line(s):
     # Remove trailing (cid) after names, but keep other parentheses like (2回合)
     s = re.sub(r'([\u4e00-\u9fffA-Za-z_]+)\(\d+\)', r'\1', s)
+    line = s
+
+    # Section / header styling
+    if line.startswith("【") and "】" in line:
+        head, rest = line.split("】", 1)
+        line = f"<b>{head}】</b>{rest}"
+    if "====" in line:
+        line = f"<b>{line}</b>"
+
+    # Bullet styling
+    if line.strip().startswith(("·", "•")):
+        line = f"<span class='log-bullet'>{line}</span>"
+
+    # Kill / elimination highlighting: ONLY color eliminated role(s) red
+    def _mark_victim(m):
+        kw = m.group(1)
+        name = m.group(2)
+        return f"{kw} <span class='log-kill'>{name}</span>"
+
+    line = re.sub(r'(淘汰|击杀|斩杀)\s*[:：]\s*([\u4e00-\u9fffA-Za-z_]+)', _mark_victim, line)
+    line = re.sub(r'(淘汰|击杀|斩杀)\s+([\u4e00-\u9fffA-Za-z_]+)', _mark_victim, line)
+    line = re.sub(r'(目标(?:被)?(?:淘汰|击杀|斩杀))\s*[:：]?\s*([\u4e00-\u9fffA-Za-z_]+)',
+                  lambda m: f"{m.group(1)} <span class='log-kill'>{m.group(2)}</span>", line)
+
+    # Bold all role names wherever they appear in the (already formatted) line.
+    # We avoid bolding inside HTML tags by only replacing plain-text occurrences.
+    try:
+        for nm in LOG_ROLE_NAMES:
+            if not nm:
+                continue
+            line = re.sub(re.escape(nm), f"<b class='log-name'>{nm}</b>", line)
+    except Exception:
+        pass
+
+    return f"<div class='log-line'>{line}</div>"
+
 
     # Bold all role names wherever they appear in the log line
     # (Names list is computed per rerun from current roles_map)
@@ -353,7 +400,7 @@ def step_playback():
 # ----------------------------
 # Controls (match a1.1.10)
 # ----------------------------
-st.caption(f"UI VERSION: {UI_VERSION}")
+st.caption("alpha 1.1.10")
 
 # Tk a1.1.10 has: 新开局 / 下一回合 / 下一行 / 自动播放 / 暂停 / 播放速度
 # Streamlit keeps them on top (per your request) but the behavior matches:
@@ -406,6 +453,8 @@ def _auto_play():
 def _pause():
     st.session_state.playing = False
     st.session_state.did_tick = False
+    st.session_state.waiting_next_turn = False
+    st.session_state.next_turn_at = 0.0
 
 def _recommended_interval_ms():
     # Match tk: if "触发随机事件：" appears, pause at least 3s for readability.
@@ -435,6 +484,7 @@ with c5:
     pause_clicked = st.button("暂停", use_container_width=True)
 with c6:
     st.session_state.speed = st.slider("播放速度（秒/行）", 0.10, 2.00, float(st.session_state.speed), 0.05)
+    st.session_state.auto_skip = st.checkbox("5秒自动下回合", value=bool(st.session_state.auto_skip))
 
 if new_clicked:
     engine.new_game()
@@ -466,6 +516,17 @@ if st.session_state.playing:
     st_autorefresh(interval=_recommended_interval_ms(), key="anim_tick")
     st.session_state.did_tick = True
 
+# Auto-skip waiting loop (rerun until it is time to advance)
+if st.session_state.waiting_next_turn:
+    # keep page alive while waiting; low frequency to reduce flicker
+    st_autorefresh(interval=500, key="autoskip_tick")
+    if time.time() >= float(st.session_state.next_turn_at or 0.0):
+        st.session_state.waiting_next_turn = False
+        st.session_state.next_turn_at = 0.0
+        _build_turn_like_a1110()
+        st.rerun()
+
+
 def _advance_if_playing():
     # Advance exactly one line per autorefresh tick.
     if not st.session_state.playing:
@@ -481,6 +542,10 @@ def _advance_if_playing():
     if st.session_state.frame_i >= max(0, len(frames) - 1):
         st.session_state.playing = False
         st.session_state.did_tick = False
+        # Auto-skip next turn after 5 seconds (a1.1.10 option)
+        if st.session_state.auto_skip:
+            st.session_state.waiting_next_turn = True
+            st.session_state.next_turn_at = time.time() + 5.0
         return
     st.session_state.frame_i += 1
     st.session_state.did_tick = False
@@ -488,8 +553,6 @@ def _advance_if_playing():
 _advance_if_playing()
 
 
-if st.session_state.playing:
-    st.info("自动播放中…（暂停可停止）")
 
 # ----------------------------
 # Panels

@@ -1082,6 +1082,17 @@ class Engine:
             self._log("【提示】本局已结束，请点击【新开局】重新开始。")
             return
         self.turn += 1
+        # ---- Per-turn status TTL decay (fix: purify expires correctly) ----
+        for _cid, _r in self.roles.items():
+            st = _r.status
+            # Purify: lasts exactly N turns, then expires
+            if hasattr(st, "purify_ttl"):
+                if st.purify_ttl > 0:
+                    st.purify_ttl -= 1
+                    if st.purify_ttl <= 0:
+                        st.purify_ttl = 0
+        # ---------------------------------------------------------------
+
         self._active_logged.clear()
         self.world_event_triggered_this_turn = False
         # reset per-turn markers

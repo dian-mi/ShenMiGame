@@ -1,2 +1,2 @@
-streamlit
-streamlit-autorefresh
+streamlit==1.39.0
+streamlit-autorefresh==1.0.1

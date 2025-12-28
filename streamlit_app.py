@@ -7,7 +7,7 @@ from streamlit_autorefresh import st_autorefresh
 import math
 
 st.set_page_config(page_title="神秘游戏", layout="wide")
-UI_VERSION = "v9-2025-12-27"
+UI_VERSION = "version:alpha 1.1.10   made by dian_mi"
 
 # Keep big UI framework unchanged; only extend role list beyond 26 (supports 43+).
 st.markdown("""

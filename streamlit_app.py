@@ -180,24 +180,87 @@ def step_playback():
     st.session_state.frame_i += 1
 
 # ----------------------------
-# Controls
+# Controls (match a1.1.10)
 # ----------------------------
 st.caption(f"UI VERSION: {UI_VERSION}")
 
-c1, c2, c3, c4, c5 = st.columns([1.1, 1.1, 1.3, 1.7, 2.0], gap="small")
-with c1:
-    new_clicked = st.button("新开局", use_container_width=True, disabled=st.session_state.playing)
-with c2:
-    next_clicked = st.button("下一回合", use_container_width=True, disabled=st.session_state.playing)
-with c3:
-    st.button("自动播放（单回合）", use_container_width=True, disabled=True)
-with c4:
-    st.session_state.speed = st.slider("播放速度（秒/行）", 0.05, 0.80, float(st.session_state.speed), 0.05)
-with c5:
+# Tk a1.1.10 has: 新开局 / 下一回合 / 下一行 / 自动播放 / 暂停 / 播放速度
+# Streamlit keeps them on top (per your request) but the behavior matches:
+# - 下一回合: advances engine.next_turn(), then immediately reveals 2 lines (if available) and starts auto-play for the rest
+# - 下一行: reveals exactly 1 more line (manual step; does not force auto-play)
+# - 自动播放: starts auto-play from current position (does not advance turn)
+# - 暂停: stops auto-play at current line
+def _build_turn_like_a1110():
+    # Similar to UI.on_build_turn() in a1.1.10:
+    # tick_alive_turns() -> next_turn() -> reveal 2 lines immediately (if possible) -> continue auto-play
+    before_len = len(getattr(engine, "log", []))
+    tick = getattr(engine, "tick_alive_turns", None)
+    if callable(tick):
+        tick()
+    engine.next_turn()
+    frames = getattr(engine, "replay_frames", None) or []
+    st.session_state.turn_frames = frames
+    st.session_state.turn_start_log_len = before_len
+
+    if not frames:
+        st.session_state.frame_i = 0
+        st.session_state.playing = False
+        return
+
+    # Reveal the first line, then immediately reveal one more line and enter auto-play (old behavior).
+    st.session_state.frame_i = min(1, len(frames) - 1)
+    st.session_state.playing = True
+
+def _step_one_line():
+    frames = st.session_state.turn_frames or []
+    if not frames:
+        return
+    if st.session_state.frame_i >= max(0, len(frames) - 1):
+        return
+    st.session_state.frame_i += 1
+
+def _auto_play():
+    frames = st.session_state.turn_frames or []
+    if not frames:
+        return
+    # Avoid stacking (same as tk)
     if st.session_state.playing:
-        st.info("下一回合逐行播放中…")
-    else:
-        st.caption("逻辑：按【下一回合】→开始该回合逐行播放（与 a1.1.10 一致）。")
+        return
+    st.session_state.playing = True
+    # Match tk: clicking auto-play should immediately advance 1 line.
+    _step_one_line()
+
+def _pause():
+    st.session_state.playing = False
+
+def _recommended_interval_ms():
+    # Match tk: if "触发随机事件：" appears, pause at least 3s for readability.
+    base = int(max(0.1, min(2.0, float(st.session_state.speed))) * 1000)
+    frames = st.session_state.turn_frames or []
+    if st.session_state.playing and frames:
+        nxt_i = min(st.session_state.frame_i + 1, len(frames) - 1)
+        try:
+            txt = (frames[nxt_i] or {}).get("text", "")
+            if "触发随机事件：" in txt:
+                base = max(base, 3000)
+        except Exception:
+            pass
+    return max(80, base)
+
+# Buttons row (top, but same semantics as Tk bottom bar)
+c1, c2, c3, c4, c5, c6 = st.columns([1.05, 1.05, 1.05, 1.05, 1.05, 1.75], gap="small")
+with c1:
+    new_clicked = st.button("新开局", use_container_width=True)
+with c2:
+    next_turn_clicked = st.button("下一回合", use_container_width=True)
+with c3:
+    next_line_clicked = st.button("下一行", use_container_width=True)
+with c4:
+    auto_clicked = st.button("自动播放", use_container_width=True)
+with c5:
+    pause_clicked = st.button("暂停", use_container_width=True)
+with c6:
+    st.session_state.speed = st.slider("播放速度（秒/行）", 0.10, 2.00, float(st.session_state.speed), 0.05)
 
 if new_clicked:
     engine.new_game()
@@ -205,15 +268,45 @@ if new_clicked:
     st.session_state.playing = False
     st.session_state.turn_frames = []
     st.session_state.frame_i = 0
+    st.session_state.turn_start_log_len = 0
     st.rerun()
 
-if next_clicked:
-    start_next_turn_playback()
+if next_turn_clicked:
+    _build_turn_like_a1110()
     st.rerun()
+
+if next_line_clicked:
+    _step_one_line()
+    st.rerun()
+
+if auto_clicked:
+    _auto_play()
+    st.rerun()
+
+if pause_clicked:
+    _pause()
+    st.rerun()
+
+# Auto-play tick (one line per tick)
+if st.session_state.playing:
+    st_autorefresh(interval=_recommended_interval_ms(), key="anim_tick")
+
+def _advance_if_playing():
+    if not st.session_state.playing:
+        return
+    frames = st.session_state.turn_frames or []
+    if not frames:
+        st.session_state.playing = False
+        return
+    if st.session_state.frame_i >= max(0, len(frames) - 1):
+        st.session_state.playing = False
+        return
+    st.session_state.frame_i += 1
+
+_advance_if_playing()
 
 if st.session_state.playing:
-    st_autorefresh(interval=int(max(80, float(st.session_state.speed) * 1000)), key="anim_tick")
-    step_playback()
+    st.info("自动播放中…（暂停可停止）")
 
 # ----------------------------
 # Panels

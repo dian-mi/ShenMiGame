@@ -272,11 +272,11 @@ def format_log_line(s):
         return f"{kw} <span class='log-kill'>{name}</span>"
 
     # With colon
-    line = re.sub(r'(淘汰|击杀|斩杀)\s*[:：]\s*([\u4e00-\u9fffA-Za-z_]+)', _mark_victim, line)
+    line = re.sub(r'(淘汰|击杀|斩杀|(?:护盾)?抵死|爆炸身亡|身亡|死亡|出局)\s*[:：]\s*([\u4e00-\u9fffA-Za-z_]+)', _mark_victim, line)
     # With whitespace
-    line = re.sub(r'(淘汰|击杀|斩杀)\s+([\u4e00-\u9fffA-Za-z_]+)', _mark_victim, line)
+    line = re.sub(r'(淘汰|击杀|斩杀|(?:护盾)?抵死|爆炸身亡|身亡|死亡|出局)\s+([\u4e00-\u9fffA-Za-z_]+)', _mark_victim, line)
     # "目标斩杀/击杀/淘汰" variants (keep "目标" as-is)
-    line = re.sub(r'(目标(?:被)?(?:淘汰|击杀|斩杀))\s*[:：]?\s*([\u4e00-\u9fffA-Za-z_]+)',
+    line = re.sub(r'(目标(?:被)?(?:淘汰|击杀|斩杀|(?:护盾)?抵死|爆炸身亡|身亡|死亡|出局))\s*[:：]?\s*([\u4e00-\u9fffA-Za-z_]+)',
                   lambda m: f"{m.group(1)} <span class='log-kill'>{m.group(2)}</span>", line)
 
     return f"<div class='log-line'>{line}</div>"
@@ -364,6 +364,7 @@ def _auto_play():
 
 def _pause():
     st.session_state.playing = False
+    st.session_state.did_tick = False
 
 def _recommended_interval_ms():
     # Match tk: if "触发随机事件：" appears, pause at least 3s for readability.
@@ -520,8 +521,8 @@ PANEL_CSS = """<style>
   .role-name{ white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .role-right{ display:flex; gap:10px; align-items:center; }
   .sttok{ display:inline-block; padding:2px 8px; border-radius:999px; font-size:14px; font-weight:700; border:1px solid rgba(0,0,0,0.10); background:rgba(0,0,0,0.03); line-height:1.2; }
-  .focus{ background:#d6ecff !important; box-shadow: inset 4px 0 0 #2E86C1; font-weight:600; }
-  .selected{ background:var(--select); }
+  .focus{ background:var(--select) !important; }
+  .selected{ background:var(--select) !important; }
   .dead{ opacity:0.45; text-decoration:line-through; }
   .log-line{ padding:3px 10px; font-size:16px; line-height:1.25; white-space:pre-wrap; color:var(--text); }
   .log-empty{ color:var(--muted); }

@@ -224,14 +224,15 @@ def get_selected_from_frame(fr, roles_map):
 
 
 def get_focus_from_frame(fr, roles_map):
-    """Return the primary triggering role cid for the current frame.
-    Uses frame highlights if present; falls back to last focus to keep continuity."""
+    """Return primary triggering role cid for current frame.
+    Prefer actor/trigger in highlights; fallback to first valid cid."""
     hs = fr.get("highlights") if isinstance(fr, dict) else None
-    if hs:
+    if isinstance(hs, list):
+        # Prefer actor/trigger roles
         for h in hs:
             if isinstance(h, dict) and h.get("cid") in roles_map:
-                return h["cid"]
-    return st.session_state.focus_cid
+                return h.get("cid")
+    return None
 
 def format_log_line(line: str) -> str:
     if not line:
@@ -412,6 +413,7 @@ if st.session_state.playing and st.session_state.turn_frames:
     fi = min(st.session_state.frame_i, len(st.session_state.turn_frames)-1)
     fr = st.session_state.turn_frames[fi]
     st.session_state.selected_cid = get_selected_from_frame(fr, roles_map)
+    st.session_state.focus_cid = get_focus_from_frame(fr, roles_map)
     st.session_state.focus_cid = get_focus_from_frame(fr, roles_map)
 else:
     st.session_state.focus_cid = None

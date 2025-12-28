@@ -39,8 +39,8 @@ if "speed" not in st.session_state:
 if "did_tick" not in st.session_state:
     st.session_state.did_tick = False
 
-if "focus_cid" not in st.session_state:
-    st.session_state.focus_cid = None
+if "focus_cids" not in st.session_state:
+    st.session_state.focus_cids = []
 if "playing" not in st.session_state:
     st.session_state.playing = False
 if "frame_i" not in st.session_state:
@@ -227,16 +227,21 @@ def get_selected_from_frame(fr, roles_map):
 
 
 def get_focus_from_frame(fr, roles_map):
-    """Return primary triggering role cid for current frame.
-    engine_core: highlights is List[int] parsed from current log line."""
+    """Return triggering role cids for current frame.
+    engine_core: highlights is List[int] parsed from current log line.
+    We keep all valid cids so both actor and target can be highlighted."""
     hs = fr.get("highlights") if isinstance(fr, dict) else None
+    out = []
     if isinstance(hs, list) and hs:
         for h in hs:
-            if isinstance(h, int) and h in roles_map:
-                return h
-            if isinstance(h, dict) and h.get("cid") in roles_map:
-                return h.get("cid")
-    return None
+            cid = None
+            if isinstance(h, int):
+                cid = h
+            elif isinstance(h, dict):
+                cid = h.get("cid")
+            if cid in roles_map and cid not in out:
+                out.append(cid)
+    return out
 
 def format_log_line(line: str) -> str:
     if not line:
@@ -417,10 +422,9 @@ if st.session_state.playing and st.session_state.turn_frames:
     fi = min(st.session_state.frame_i, len(st.session_state.turn_frames)-1)
     fr = st.session_state.turn_frames[fi]
     st.session_state.selected_cid = get_selected_from_frame(fr, roles_map)
-    st.session_state.focus_cid = get_focus_from_frame(fr, roles_map)
-    st.session_state.focus_cid = get_focus_from_frame(fr, roles_map)
+    st.session_state.focus_cids = get_focus_from_frame(fr, roles_map)
 else:
-    st.session_state.focus_cid = None
+    st.session_state.focus_cids = []
 
 alive_rank = [cid for cid in rank if roles_map.get(cid, {}).get("alive", True)]
 numbered = list(enumerate(alive_rank, start=1))
@@ -436,7 +440,7 @@ def render_role_rows(slice_):
     for i, cid in slice_:
         info = roles_map.get(cid, {})
         cls = "role-row"
-        if st.session_state.focus_cid == cid:
+        if cid in (st.session_state.focus_cids or []):
             cls += " focus"
         if st.session_state.selected_cid == cid:
             cls += " selected"
@@ -478,6 +482,7 @@ PANEL_CSS = """<style>
   .role-name{ white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .role-right{ display:flex; gap:10px; align-items:center; }
   .sttok{ display:inline-block; padding:2px 8px; border-radius:999px; font-size:14px; font-weight:700; border:1px solid rgba(0,0,0,0.10); background:rgba(0,0,0,0.03); line-height:1.2; }
+  .focus{ background:#d6ecff !important; box-shadow: inset 4px 0 0 #2E86C1; font-weight:600; }
   .selected{ background:var(--select); }
   .dead{ opacity:0.45; text-decoration:line-through; }
   .log-line{ padding:3px 10px; font-size:16px; line-height:1.25; white-space:pre-wrap; color:var(--text); }

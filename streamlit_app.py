@@ -116,9 +116,55 @@ def build_roles_map_from_engine():
         }
     return roles_map
 
-def merge_snap_with_engine(snap):
+def _normalize_snap(snap):
+    """Engine replay_frames store snapshots as {'rank': [...], 'status': {cid:{alive,brief,name}}}.
+    Streamlit UI expects 'roles' mapping. This helper converts/normalizes both shapes."""
     if not isinstance(snap, dict):
         snap = {}
+    # If snapshot uses 'status' (engine format), convert to 'roles'
+    if "roles" not in snap and isinstance(snap.get("status"), dict):
+        roles = {}
+        for k, v in snap.get("status", {}).items():
+            try:
+                cid = int(k)
+            except Exception:
+                cid = k
+            if isinstance(v, dict):
+                roles[cid] = {
+                    "alive": bool(v.get("alive", True)),
+                    "brief": v.get("brief", ""),
+                    "name": v.get("name", str(cid)),
+                }
+        snap = dict(snap)  # shallow copy
+        snap["roles"] = roles
+    # If roles keys came as strings, normalize to int where possible
+    if isinstance(snap.get("roles"), dict):
+        norm_roles = {}
+        for k, v in snap["roles"].items():
+            try:
+                cid = int(k)
+            except Exception:
+                cid = k
+            norm_roles[cid] = v if isinstance(v, dict) else {}
+        snap = dict(snap)
+        snap["roles"] = norm_roles
+    # Rank keys normalize
+    if isinstance(snap.get("rank"), list):
+        norm_rank = []
+        for x in snap["rank"]:
+            try:
+                norm_rank.append(int(x))
+            except Exception:
+                norm_rank.append(x)
+        snap = dict(snap)
+        snap["rank"] = norm_rank
+    return snap
+
+def merge_snap_with_engine(snap):
+    """Merge a snapshot with current engine data.
+    IMPORTANT: snapshot wins (so role panel matches the currently shown log line).
+    Engine is only used as a fallback for missing fields / newly spawned NPCs."""
+    snap = _normalize_snap(snap)
     snap.setdefault("rank", list(getattr(engine, "rank", [])))
     snap.setdefault("roles", {})
     eng = build_roles_map_from_engine()

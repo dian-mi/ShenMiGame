@@ -4,10 +4,12 @@ import importlib
 import streamlit as st
 import streamlit.components.v1 as components
 from streamlit_autorefresh import st_autorefresh
+import math
 
 st.set_page_config(page_title="神秘游戏", layout="wide")
-UI_VERSION = "v8-2025-12-27"
+UI_VERSION = "v9-2025-12-27"
 
+# Keep big UI framework unchanged; only extend role list beyond 26 (supports 43+).
 st.markdown("""
 <style>
   html, body, [data-testid="stAppViewContainer"] { height: 100%; overflow: hidden; }
@@ -28,6 +30,9 @@ def load_engine():
 
 engine = load_engine()
 
+# ----------------------------
+# State (a1.1.10 playback: 下一回合 triggers playback for that turn)
+# ----------------------------
 if "speed" not in st.session_state:
     st.session_state.speed = 0.25
 if "playing" not in st.session_state:
@@ -41,6 +46,9 @@ if "turn_start_log_len" not in st.session_state:
 if "selected_cid" not in st.session_state:
     st.session_state.selected_cid = None
 
+# ----------------------------
+# Status colors (aligned to your a1.1.10 screenshot palette)
+# ----------------------------
 STATUS_COLOR = {
     "护盾": "#f5a623",
     "净化": "#2ecc71",
@@ -171,6 +179,9 @@ def step_playback():
         return
     st.session_state.frame_i += 1
 
+# ----------------------------
+# Controls
+# ----------------------------
 st.caption(f"UI VERSION: {UI_VERSION}")
 
 c1, c2, c3, c4, c5 = st.columns([1.1, 1.1, 1.3, 1.7, 2.0], gap="small")
@@ -204,6 +215,9 @@ if st.session_state.playing:
     st_autorefresh(interval=int(max(80, float(st.session_state.speed) * 1000)), key="anim_tick")
     step_playback()
 
+# ----------------------------
+# Panels
+# ----------------------------
 snap = get_current_snap()
 rank = snap.get("rank", [])
 roles_map = snap.get("roles", {})
@@ -215,8 +229,12 @@ if st.session_state.playing and st.session_state.turn_frames:
 
 alive_rank = [cid for cid in rank if roles_map.get(cid, {}).get("alive", True)]
 numbered = list(enumerate(alive_rank, start=1))
-left_part = numbered[:13]
-mid_part = numbered[13:26]
+
+# IMPORTANT CHANGE (v9):
+# Split all alive roles (43+) into two columns evenly, instead of truncating to 26.
+half = int(math.ceil(len(numbered) / 2)) if numbered else 0
+left_part = numbered[:half]
+mid_part  = numbered[half:]
 
 def render_role_rows(slice_):
     rows = []
@@ -237,8 +255,7 @@ def render_role_rows(slice_):
   </div>
   <div class='role-right'>{right}</div>
 </div>""")
-    while len(rows) < 13:
-        rows.append("<div class='role-row'><div class='role-left'><div class='role-idx'>&nbsp;</div><div class='role-name'>&nbsp;</div></div><div class='role-right'></div></div>")
+    # no more hard padding to 13 lines; because we now support long lists (scroll).
     return "".join(rows)
 
 left_rows = render_role_rows(left_part)
@@ -250,7 +267,6 @@ if st.session_state.playing and st.session_state.turn_frames:
     log_lines = full_log[:shown][-400:]
 else:
     log_lines = full_log[-400:]
-
 log_html = "".join(format_log_line(s) for s in log_lines)
 
 PANEL_CSS = """<style>
@@ -285,7 +301,6 @@ def log_panel_html(title, lines):
 </body></html>"""
 
 IFRAME_H = 860
-
 colA, colB, colC = st.columns([1.0, 1.0, 1.15], gap="small")
 with colA:
     components.html(role_panel_html("角色", left_rows), height=IFRAME_H, scrolling=False)

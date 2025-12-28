@@ -1,1 +1,1 @@
-UI v8: bottom cutoff fixed by taller iframe and 100% panel height; playback logic matches a1.1.10 (press 下一回合 to start that turn's line-by-line playback).
+UI v9: keep UI framework; extend role list to support 43+ roles by splitting all alive roles evenly across the two role columns (no truncation to 26).

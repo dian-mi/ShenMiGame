@@ -262,6 +262,10 @@ def format_log_line(s):
     s = re.sub(r'([\u4e00-\u9fffA-Za-z_]+)\(\d+\)', r'\1', s)
     line = s
 
+    # Random event line highlight (gold, match a1.1.10)
+    if "触发随机事件" in line or "随机事件：" in line:
+        line = f"<span class='log-event'>{line}</span>"
+
     # Section / header styling
     if line.startswith("【") and "】" in line:
         head, rest = line.split("】", 1)
@@ -634,6 +638,8 @@ PANEL_CSS = """<style>
   .dead{ opacity:0.45; text-decoration:line-through; }
   .log-line{ padding:3px 10px; font-size:16px; line-height:1.25; white-space:pre-wrap; color:var(--text); }
   .log-empty{ color:var(--muted); }
+  .log-event{ color:#c9a227; font-weight:700; }
+  .log-line b{ font-weight:800; }
   .log-name{ font-weight:800; }
   .log-kill{ color:var(--kill); font-weight:900; }
   .log-bullet{ color:var(--muted); font-weight:700; }

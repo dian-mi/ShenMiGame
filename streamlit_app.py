@@ -515,44 +515,44 @@ if pause_clicked:
     _pause()
     st.rerun()
 
-# Auto-play tick (one line per tick)
-if st.session_state.playing:
-    st_autorefresh(interval=_recommended_interval_ms(), key="anim_tick")
+# Auto-play / autoskip tick handled by a single timer below
+# Unified timer tick (reduces flicker by avoiding multiple autorefresh sources)
+st.session_state.did_tick = False
+if st.session_state.playing or st.session_state.waiting_next_turn:
+    interval = _recommended_interval_ms() if st.session_state.playing else 500
+    st_autorefresh(interval=interval, key="main_tick")
     st.session_state.did_tick = True
 
-# Auto-skip waiting loop (rerun until it is time to advance)
-if st.session_state.waiting_next_turn:
-    # keep page alive while waiting; low frequency to reduce flicker
-    st_autorefresh(interval=500, key="autoskip_tick")
+# Auto-skip: when waiting, advance after 5 seconds
+if st.session_state.waiting_next_turn and st.session_state.did_tick:
     if time.time() >= float(st.session_state.next_turn_at or 0.0):
         st.session_state.waiting_next_turn = False
         st.session_state.next_turn_at = 0.0
         _build_turn_like_a1110()
         st.rerun()
 
+    st.session_state.did_tick = True
+
+
 
 def _advance_if_playing():
-    # Advance exactly one line per autorefresh tick.
+    # Advance exactly one line per unified timer tick.
     if not st.session_state.playing:
-        st.session_state.did_tick = False
         return
     if not st.session_state.did_tick:
         return
     frames = st.session_state.turn_frames or []
     if not frames:
         st.session_state.playing = False
-        st.session_state.did_tick = False
         return
     if st.session_state.frame_i >= max(0, len(frames) - 1):
         st.session_state.playing = False
-        st.session_state.did_tick = False
-        # Auto-skip next turn after 5 seconds (a1.1.10 option)
+        # Schedule auto-skip next turn after 5 seconds (a1.1.10 option)
         if st.session_state.auto_skip:
             st.session_state.waiting_next_turn = True
             st.session_state.next_turn_at = time.time() + 5.0
         return
     st.session_state.frame_i += 1
-    st.session_state.did_tick = False
 
 _advance_if_playing()
 

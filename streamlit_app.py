@@ -7,7 +7,7 @@ from streamlit_autorefresh import st_autorefresh
 import math
 
 st.set_page_config(page_title="神秘游戏", layout="wide")
-UI_VERSION = "version:alpha 1.1.10   made by dian_mi"
+UI_VERSION = "v9-2025-12-27"
 
 # Keep big UI framework unchanged; only extend role list beyond 26 (supports 43+).
 st.markdown("""
@@ -43,12 +43,15 @@ if "focus_cids" not in st.session_state:
     st.session_state.focus_cids = []
 if "playing" not in st.session_state:
     st.session_state.playing = False
+if "playback_active" not in st.session_state:
+    st.session_state.playback_active = False
 if "frame_i" not in st.session_state:
     st.session_state.frame_i = 0
 if "turn_frames" not in st.session_state:
     st.session_state.turn_frames = []
 if "turn_start_log_len" not in st.session_state:
     st.session_state.turn_start_log_len = 0
+    st.session_state.playback_active = False
 if "selected_cid" not in st.session_state:
     st.session_state.selected_cid = None
 
@@ -202,7 +205,7 @@ def merge_snap_with_engine(snap):
     return snap
 
 def get_current_snap():
-    if st.session_state.playing and st.session_state.turn_frames:
+    if st.session_state.playback_active and st.session_state.turn_frames:
         fi = min(st.session_state.frame_i, len(st.session_state.turn_frames)-1)
         fr = st.session_state.turn_frames[fi]
         snap = fr.get("snap") if isinstance(fr, dict) else None
@@ -272,11 +275,11 @@ def format_log_line(s):
         return f"{kw} <span class='log-kill'>{name}</span>"
 
     # With colon
-    line = re.sub(r'(淘汰|击杀|斩杀|(?:护盾)?抵死|爆炸身亡|身亡|死亡|出局)\s*[:：]\s*([\u4e00-\u9fffA-Za-z_]+)', _mark_victim, line)
+    line = re.sub(r'(淘汰|击杀|斩杀)\s*[:：]\s*([\u4e00-\u9fffA-Za-z_]+)', _mark_victim, line)
     # With whitespace
-    line = re.sub(r'(淘汰|击杀|斩杀|(?:护盾)?抵死|爆炸身亡|身亡|死亡|出局)\s+([\u4e00-\u9fffA-Za-z_]+)', _mark_victim, line)
+    line = re.sub(r'(淘汰|击杀|斩杀)\s+([\u4e00-\u9fffA-Za-z_]+)', _mark_victim, line)
     # "目标斩杀/击杀/淘汰" variants (keep "目标" as-is)
-    line = re.sub(r'(目标(?:被)?(?:淘汰|击杀|斩杀|(?:护盾)?抵死|爆炸身亡|身亡|死亡|出局))\s*[:：]?\s*([\u4e00-\u9fffA-Za-z_]+)',
+    line = re.sub(r'(目标(?:被)?(?:淘汰|击杀|斩杀))\s*[:：]?\s*([\u4e00-\u9fffA-Za-z_]+)',
                   lambda m: f"{m.group(1)} <span class='log-kill'>{m.group(2)}</span>", line)
 
     return f"<div class='log-line'>{line}</div>"
@@ -333,6 +336,8 @@ def _build_turn_like_a1110():
     frames = getattr(engine, "replay_frames", None) or []
     st.session_state.turn_frames = frames
     st.session_state.turn_start_log_len = before_len
+
+    st.session_state.playback_active = True
 
     if not frames:
         st.session_state.frame_i = 0
@@ -457,7 +462,7 @@ snap = get_current_snap()
 rank = snap.get("rank", [])
 roles_map = snap.get("roles", {})
 
-if st.session_state.playing and st.session_state.turn_frames:
+if st.session_state.playback_active and st.session_state.turn_frames:
     fi = min(st.session_state.frame_i, len(st.session_state.turn_frames)-1)
     fr = st.session_state.turn_frames[fi]
     st.session_state.selected_cid = get_selected_from_frame(fr, roles_map)

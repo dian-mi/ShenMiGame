@@ -39,7 +39,7 @@ if "speed" not in st.session_state:
 if "did_tick" not in st.session_state:
     st.session_state.did_tick = False
 
-if \"focus_cid\" not in st.session_state:
+if "focus_cid" not in st.session_state:
     st.session_state.focus_cid = None
 if "playing" not in st.session_state:
     st.session_state.playing = False

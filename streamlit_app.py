@@ -243,19 +243,57 @@ def get_focus_from_frame(fr, roles_map):
                 out.append(cid)
     return out
 
-def format_log_line(line: str) -> str:
-    if not line:
-        return "<div class='log-line log-empty'> </div>"
-    esc = (line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
-    if "====" in esc or "【新开局】" in esc:
-        esc = NAME_IN_BRACKETS.sub(lambda m: f"<span class='log-section'>【{strip_name_num(m.group(1))}】</span>", esc)
-        return f"<div class='log-line log-section'>{esc}</div>"
-    if esc.startswith("·") or esc.startswith("•"):
-        esc = f"<span class='log-bullet'>·</span>{esc[1:]}"
-    esc = NAME_IN_BRACKETS.sub(lambda m: f"<span class='log-name'>【{strip_name_num(m.group(1))}】</span>", esc)
-    if any(k in esc for k in ["淘汰", "击杀", "斩杀"]):
-        esc = esc.replace("class='log-name'", "class='log-name log-kill'")
-    return f"<div class='log-line'>{esc}</div>"
+def format_log_line(s):
+    # Remove trailing (cid) after names, but keep other parentheses like (2回合)
+    # Pattern: Name(number) -> Name
+    s = re.sub(r'([\u4e00-\u9fffA-Za-z_]+)\(\d+\)', r'\1', s)
+
+    line = s
+
+    # Section / header styling
+    if line.startswith("【") and "】" in line:
+        head, rest = line.split("】", 1)
+        line = f"<b>{head}】</b>{rest}"
+    if "====" in line:
+        line = f"<b>{line}</b>"
+
+    # Bullet styling
+    if line.strip().startswith(("·", "•")):
+        line = f"<span class='log-bullet'>{line}</span>"
+
+    # Kill / elimination highlighting: ONLY color eliminated role(s) red
+    # Common patterns:
+    #   "淘汰 XXX", "击杀 XXX", "斩杀 XXX"
+    #   "淘汰：XXX", "击杀：XXX", "斩杀：XXX"
+    #   "目标淘汰：XXX" (rare)
+    def _mark_victim(m):
+        kw = m.group(1)
+        name = m.group(2)
+        return f"{kw} <span class='log-kill'>{name}</span>"
+
+    # With colon
+    line = re.sub(r'(淘汰|击杀|斩杀)\s*[:：]\s*([\u4e00-\u9fffA-Za-z_]+)', _mark_victim, line)
+    # With whitespace
+    line = re.sub(r'(淘汰|击杀|斩杀)\s+([\u4e00-\u9fffA-Za-z_]+)', _mark_victim, line)
+    # "目标斩杀/击杀/淘汰" variants (keep "目标" as-is)
+    line = re.sub(r'(目标(?:被)?(?:淘汰|击杀|斩杀))\s*[:：]?\s*([\u4e00-\u9fffA-Za-z_]+)',
+                  lambda m: f"{m.group(1)} <span class='log-kill'>{m.group(2)}</span>", line)
+
+    return f"<div class='log-line'>{line}</div>"
+
+
+    line = s
+    if line.startswith("【") and "】" in line:
+        head, rest = line.split("】", 1)
+        line = f"<b>{head}】</b>{rest}"
+    if "====" in line:
+        line = f"<b>{line}</b>"
+    if line.strip().startswith(("·", "•")):
+        line = f"<span class='log-bullet'>{line}</span>"
+    if any(k in line for k in ("淘汰", "击杀", "斩杀")):
+        line = re.sub(r'([\u4e00-\u9fffA-Za-z_]+)', r"<span class='log-kill'>\1</span>", line, count=1)
+    return f"<div class='log-line'>{line}</div>"
+
 
 def start_next_turn_playback():
     before_len = len(getattr(engine, "log", []))
